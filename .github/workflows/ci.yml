@@ -36,7 +36,11 @@ jobs:
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X github.com/dismay712/lacron/internal/lacron.Version=${GITHUB_SHA::12}" -o bin/lacron-linux-amd64 ./cmd/lacron
       - name: Build with latest Alpine and Node LTS
-        run: docker build --pull --build-arg VERSION="${GITHUB_SHA::12}" -t lacron:ci .
+        run: >-
+          docker build --pull
+          --build-arg VERSION="${GITHUB_SHA::12}"
+          --label "org.opencontainers.image.revision=$GITHUB_SHA"
+          -t lacron:ci .
       - name: Exercise real cron and Node in the container
         run: python3 tests/smoke.py lacron:ci
       - name: Install browser test dependencies
@@ -65,3 +69,77 @@ jobs:
             bin/lacron-linux-amd64
             lacron-image-amd64.tar.gz
           retention-days: 14
+
+  publish:
+    name: Publish tested image to GHCR
+    needs: verify
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download the image that passed verification
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: lacron-linux-amd64
+          path: dist
+      - name: Prepare image names
+        id: image
+        run: |
+          printf 'name=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          printf 'version=sha-%s\n' "${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Publish the tested image
+        id: push
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION: ${{ steps.image.outputs.version }}
+        run: |
+          gzip -dc dist/lacron-image-amd64.tar.gz | docker load
+          printf 'image_id=%s\n' "$(docker image inspect --format '{{.Id}}' lacron:ci)" >> "$GITHUB_OUTPUT"
+          docker tag lacron:ci "$IMAGE:$VERSION"
+          docker tag lacron:ci "$IMAGE:latest"
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+      - name: Verify the published image
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          VERSION: ${{ steps.image.outputs.version }}
+          EXPECTED_ID: ${{ steps.push.outputs.image_id }}
+        run: |
+          docker pull "$IMAGE:$VERSION"
+          docker pull "$IMAGE:latest"
+          test "$(docker image inspect --format '{{.Id}}' "$IMAGE:$VERSION")" = "$EXPECTED_ID"
+          test "$(docker image inspect --format '{{.Id}}' "$IMAGE:latest")" = "$EXPECTED_ID"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE:latest")" = linux/amd64
+          lacron_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:latest")
+          {
+            printf '## Published container image\n\n'
+            printf -- '- Image: `%s:latest`\n' "$IMAGE"
+            printf -- '- Commit tag: `%s:%s`\n' "$IMAGE" "$VERSION"
+            printf -- '- Digest: `%s`\n' "$lacron_digest"
+            printf -- '- Platform: `linux/amd64`\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Check anonymous pull access
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          lacron_anonymous_config="$RUNNER_TEMP/lacron-anonymous-docker"
+          mkdir -p "$lacron_anonymous_config"
+          if docker --config "$lacron_anonymous_config" manifest inspect "$IMAGE:latest" > "$RUNNER_TEMP/lacron-manifest.json" 2> "$RUNNER_TEMP/lacron-anonymous-error.log"; then
+            printf '\nAnonymous pull: available.\n' >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '\nAnonymous pull could not be verified. GHCR packages are private on first publication; set the package visibility to Public to allow anonymous pulls, or authenticate with a read:packages token.\n' >> "$GITHUB_STEP_SUMMARY"
+            printf '::notice::Anonymous pull could not be verified. Check package visibility in GitHub Packages settings.\n'
+          fi
+      - name: Sign out of GHCR
+        if: always()
+        run: docker logout ghcr.io

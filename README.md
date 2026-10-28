@@ -69,6 +69,42 @@ CI 每次推送、PR 和每周一都会重新测试并拉取基础镜像。可�
 gzip -dc lacron-image-amd64.tar.gz | docker load
 ```
 
+## GitHub Actions 自动构建与发布
+
+工作流位于 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，支持 `main` 推送、Pull Request、Actions 页面手动运行，以及每周一 UTC 03:17（北京时间 11:17）计划运行。
+
+`verify` 作业拉取最新基础镜像，执行 Go race/vet、真实 cron / Node.js 容器测试和 Chromium 界面测试，随后导出构建产物。`publish` 作业只在 `main` 的验证成功后执行，复用同一份已测试镜像并发布到 GHCR：
+
+- `ghcr.io/dismay712/lacron:latest`：最近一次发布。
+- `ghcr.io/dismay712/lacron:sha-<12位提交SHA>`：对应提交的构建。
+- 当前发布平台为 `linux/amd64`；镜像带有源码仓库、MIT 协议和完整提交 SHA 标签。
+
+发布使用 GitHub 自带的 `GITHUB_TOKEN`，仅发布作业申请 `packages: write` 权限，无需额外配置 Docker Hub 账号或 PAT。PR 只验证，不发布。发布后会重新拉取两个标签、核对镜像 ID 和架构，并将镜像地址与 digest 写入 Actions Summary。
+
+GHCR 首次发布的包默认是私有的。若需匿名拉取，请由仓库所有者在 [包设置](https://github.com/users/dismay712/packages/container/lacron/settings) 将可见性改为 Public；工作流会检查匿名访问是否可用。私有包可使用带 `read:packages` 权限的 GitHub PAT（classic）登录：
+
+```sh
+podman login ghcr.io -u dismay712
+```
+
+拉取和启动镜像（默认权限、可写根文件系统）：
+
+```sh
+podman pull ghcr.io/dismay712/lacron:latest
+podman run -d --name lacron \
+  --user 0:0 \
+  --restart=unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -e TZ=Asia/Shanghai \
+  -v lacron-data:/data \
+  ghcr.io/dismay712/lacron:latest
+podman exec lacron cat /data/admin.token
+```
+
+挂载自己的脚本时，可在镜像名前添加 `-v "$PWD/scripts:/scripts:ro,Z"`，并确保脚本允许容器 UID 10001 读取。只读根文件系统和最小能力配置可参考 `compose.yaml`。
+
+## 自定义镜像构建
+
 需要固定基础镜像时可覆盖 build args（可使用完整 tag 或 digest）：
 
 ```sh
