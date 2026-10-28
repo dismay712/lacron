@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="lacron — 轻量、清晰的定时任务管理工具">
+  <title>lacron · 定时任务</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="login" class="login-layout">
+    <div class="login-brand"><span class="brand-mark" aria-hidden="true">l<span>c</span></span><span>lacron<span class="brand-dot">.</span></span></div>
+    <form id="login-form" class="login-card">
+      <span class="eyebrow">YOUR TASKS. ON TIME.</span>
+      <h1>有序运行，从这里开始。</h1>
+      <p class="muted">登录你的定时任务工作空间。</p>
+      <label for="token">管理令牌</label>
+      <input id="token" type="password" placeholder="输入访问令牌" autocomplete="current-password" required spellcheck="false">
+      <p id="login-error" class="form-error" role="alert" hidden></p>
+      <button class="button primary" type="submit">进入工作空间 <span aria-hidden="true">→</span></button>
+      <p class="login-hint">首次启动后，按 README 中的步骤获取令牌。</p>
+    </form>
+    <div class="login-footer"><span>Alpine + Go + Node.js LTS</span><button class="text-button theme-button" type="button" aria-label="切换颜色主题">跟随系统</button></div>
+  </div>
+
+  <div id="workspace" class="app-layout" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="lacron 首页"><span class="brand-mark" aria-hidden="true">l<span>c</span></span>lacron<span class="brand-dot">.</span></a>
+      <span class="nav-label">工作空间</span>
+      <nav aria-label="主导航">
+        <button class="nav-item selected" id="nav-jobs" data-view="jobs"><span data-icon="grid"></span>任务调度<span class="nav-count" id="nav-count">0</span></button>
+        <button class="nav-item" id="nav-runs" data-view="runs"><span data-icon="history"></span>执行记录</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="mini-status"><span class="status-dot"></span><div><strong>轻量，持续运行。</strong><span>每一项任务，都有迹可循。</span></div></div>
+        <a href="https://github.com/dismay712/lacron" target="_blank" rel="noreferrer" class="repo-link"><span data-icon="github"></span>GitHub <span aria-hidden="true">↗</span></a>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar"><div class="breadcrumb"><span class="mobile-brand">lacron.</span><span class="desktop-breadcrumb">工作空间 <span class="slash">/</span></span><strong id="breadcrumb-current">任务调度</strong></div><div class="topbar-actions"><span class="connection" id="connection" role="status"><span class="status-dot"></span><span id="connection-text">已连接</span></span><button type="button" class="text-button theme-button">跟随系统</button><button type="button" class="icon-button" id="logout" title="退出登录" aria-label="退出登录"><span data-icon="logout"></span></button></div></header>
+      <div class="page-content">
+        <section class="page-heading"><div><div class="eyebrow">SCHEDULE WITH CLARITY</div><h1 id="page-title">任务调度</h1><p class="muted" id="page-description">把重复的工作，交给准时的每一次执行。</p></div><button type="button" class="button primary" id="new-job"><span data-icon="plus"></span>新建任务</button></section>
+
+        <nav class="mobile-nav" aria-label="移动端导航"><button type="button" class="tab selected" data-view="jobs">任务调度</button><button type="button" class="tab" data-view="runs">执行记录</button></nav>
+        <section class="metrics" aria-label="任务概览">
+          <div class="metric"><div class="metric-label">任务总数<span data-icon="layers"></span></div><div class="metric-value" id="metric-total">0</div><div class="metric-caption">你的自动化清单</div></div>
+          <div class="metric"><div class="metric-label">已启用<span class="accent" data-icon="check-circle"></span></div><div class="metric-value" id="metric-enabled">0</div><div class="metric-caption"><span class="status-dot"></span>按计划自动执行</div></div>
+          <div class="metric"><div class="metric-label">执行中<span data-icon="activity"></span></div><div class="metric-value" id="metric-running">0</div><div class="metric-caption" id="metric-concurrency">并发上限 4</div></div>
+          <div class="metric"><div class="metric-label">最近执行成功率<span data-icon="chart"></span></div><div class="metric-value" id="metric-success">—</div><div class="metric-caption" id="metric-runs">暂无执行记录</div></div>
+        </section>
+
+        <div class="runtime-bar"><div><span id="cron-dot" class="status-dot"></span><strong id="cron-label">Cron</strong><span class="runtime-separator">/</span><span id="runtime-node">Node.js LTS</span></div><div><span data-icon="globe"></span><span id="runtime-timezone">UTC</span><span class="runtime-separator">·</span><span id="runtime-version">lacron</span></div></div>
+
+        <section id="jobs-view" class="panel" aria-label="定时任务列表">
+          <div class="panel-toolbar"><div class="tabs" role="group" aria-label="任务筛选"><button type="button" class="tab selected" data-filter="all">全部任务 <span id="tab-total">0</span></button><button type="button" class="tab" data-filter="enabled">已启用</button><button type="button" class="tab" data-filter="paused">已暂停</button></div><label class="search"><span data-icon="search"></span><input id="search" type="search" placeholder="搜索名称、命令…" aria-label="搜索任务"></label></div>
+          <div class="table-scroll" id="jobs-table"><table><thead><tr><th>任务</th><th>Cron 表达式</th><th>最近执行</th><th>下次执行</th><th>状态</th><th class="align-right">操作</th></tr></thead><tbody id="job-rows"></tbody></table></div>
+          <div class="empty" id="jobs-empty"><span class="empty-icon" data-icon="calendar"></span><h2>第一项任务，从这里开始。</h2><p>定时运行 Shell 或 JavaScript 脚本，让日常工作自动发生。</p><button type="button" class="button secondary" id="empty-new-job"><span data-icon="plus"></span>创建第一个任务</button></div>
+          <footer class="panel-footer"><span id="jobs-count">共 0 个任务</span><span>标准五段式 cron <span class="footer-dot">·</span> 分钟级调度</span></footer>
+        </section>
+
+        <section id="runs-view" class="panel" aria-label="执行记录" hidden>
+          <div class="panel-toolbar"><div><strong>最近执行</strong><span class="small muted"> 保留最近 200 次</span></div><label class="run-filter"><span class="small muted">任务</span><select id="run-filter" aria-label="按任务筛选执行记录"><option value="">全部任务</option></select></label></div>
+          <div class="table-scroll" id="runs-table"><table><thead><tr><th>任务</th><th>执行状态</th><th>触发方式</th><th>开始时间</th><th>耗时</th><th class="align-right">日志</th></tr></thead><tbody id="run-rows"></tbody></table></div>
+          <div class="empty" id="runs-empty"><span class="empty-icon" data-icon="history"></span><h2>每一次执行，都有记录。</h2><p>任务运行后，可在这里查看状态、退出码和输出日志。</p></div>
+          <footer class="panel-footer"><span id="runs-count">暂无执行记录</span><span>单次日志最多 256 KiB</span></footer>
+        </section>
+        <footer class="page-footer"><span>lacron <span class="footer-dot">/</span> Small footprint. Clear control.</span><span>开源于 MIT License</span></footer>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="job-dialog" class="modal">
+    <form id="job-form">
+      <div class="modal-heading"><div><span class="eyebrow">AUTOMATE YOUR NEXT STEP</span><h2 id="job-dialog-title">新建任务</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭"><span data-icon="x"></span></button></div>
+      <div class="modal-body">
+        <label for="job-name">任务名称</label><input id="job-name" name="name" required placeholder="例如：每日数据同步" maxlength="120" autocomplete="off">
+        <div class="field-heading"><label for="job-schedule">Cron 表达式</label><select id="schedule-preset" aria-label="常用调度预设"><option value="">常用预设</option><option value="* * * * *">每分钟</option><option value="*/5 * * * *">每 5 分钟</option><option value="0 * * * *">每小时</option><option value="0 9 * * *">每天 09:00</option><option value="0 9 * * 1-5">工作日 09:00</option><option value="0 0 1 * *">每月 1 日</option></select></div>
+        <input id="job-schedule" name="schedule" class="mono" required placeholder="*/5 * * * *" autocomplete="off" spellcheck="false" maxlength="256"><p class="field-help">分 · 时 · 日 · 月 · 星期（0 为周日，6 为周六）</p>
+        <label for="job-command">执行命令</label><textarea id="job-command" name="command" class="mono" rows="4" required placeholder="node /scripts/hello.js" spellcheck="false" maxlength="8192"></textarea><p class="field-help">通过 /bin/sh 执行，支持多行命令。脚本请挂载至 /scripts。</p>
+        <div class="field-grid"><div><label for="job-directory">工作目录</label><input id="job-directory" name="working_dir" class="mono" placeholder="/scripts" required></div><div><label for="job-timeout">超时时间 <span class="muted">（秒）</span></label><input id="job-timeout" name="timeout_sec" type="number" min="1" max="86400" value="300" required></div></div>
+        <label class="checkbox-field" for="job-enabled"><input type="checkbox" id="job-enabled" name="enabled" checked><span><strong>启用定时调度</strong><span class="field-help">关闭后仍可手动执行</span></span></label>
+        <p id="job-error" class="form-error" role="alert" hidden></p>
+      </div>
+      <div class="modal-footer"><button type="button" class="button secondary close-dialog">取消</button><button type="submit" class="button primary" id="save-job">创建任务</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="log-dialog" class="modal log-modal"><div class="modal-heading"><div><span class="eyebrow">EXECUTION LOG</span><h2 id="log-title">执行日志</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭日志"><span data-icon="x"></span></button></div><div class="log-meta" id="log-meta"></div><div id="log-truncated" class="log-notice" hidden>输出已达到 256 KiB 上限，后续内容未保存。</div><pre id="log-output" tabindex="0" aria-label="任务日志"></pre><div class="modal-footer"><span class="small muted">日志每 5 秒刷新</span><button type="button" class="button secondary close-dialog">关闭</button></div></dialog>
+  <dialog id="confirm-dialog" class="modal confirm-modal"><div class="modal-heading"><h2>删除这个任务？</h2><button type="button" class="icon-button close-dialog" aria-label="关闭"><span data-icon="x"></span></button></div><div class="modal-body"><p id="confirm-description"></p><p class="small muted">删除后将停止调度，已有执行记录会继续保留。</p><p id="delete-error" class="form-error" role="alert" hidden></p></div><div class="modal-footer"><button type="button" class="button secondary close-dialog">取消</button><button type="button" class="button danger" id="confirm-delete">删除任务</button></div></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <template id="job-row-template"><tr><td><div class="task-name"><span class="task-icon" data-icon="terminal"></span><div class="task-copy"><strong class="job-name"></strong><code class="job-command"></code></div></div></td><td><code class="schedule-code"></code></td><td class="job-last"></td><td class="job-next small"></td><td><button type="button" class="toggle" role="switch"><span></span></button></td><td><div class="row-actions"><button type="button" class="icon-button run-job" title="立即执行"><span data-icon="play"></span></button><button type="button" class="icon-button job-history" title="查看记录"><span data-icon="history"></span></button><button type="button" class="icon-button edit-job" title="编辑任务"><span data-icon="edit"></span></button><button type="button" class="icon-button delete-job" title="删除任务"><span data-icon="trash"></span></button></div></td></tr></template>
+  <template id="run-row-template"><tr><td class="run-name"></td><td class="run-status"></td><td class="run-source small muted"></td><td class="run-start small"></td><td class="run-duration small mono"></td><td class="align-right"><button type="button" class="text-button open-log"><span data-icon="file"></span>查看日志</button></td></tr></template>
+</body>
+</html>

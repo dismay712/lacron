@@ -1,0 +1,12 @@
+.git
+.github
+.env
+.env.*
+data
+bin
+*.tar
+*.tar.gz
+tests
+docs
+**/*_test.go
+README.md

@@ -1,0 +1,9 @@
+.env
+data/
+bin/
+*.test
+coverage.out
+__pycache__/
+*.pyc
+*.tar
+*.tar.gz

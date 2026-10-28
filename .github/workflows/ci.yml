@@ -1,0 +1,52 @@
+name: Build and verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: Test and vet
+        run: |
+          go test -race -count=1 ./...
+          go vet ./...
+      - name: Build Linux binary
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X github.com/dismay712/lacron/internal/lacron.Version=${GITHUB_SHA::12}" -o bin/lacron-linux-amd64 ./cmd/lacron
+      - name: Build with latest Alpine and Node LTS
+        run: docker build --pull --build-arg VERSION="${GITHUB_SHA::12}" -t lacron:ci .
+      - name: Exercise real cron and Node in the container
+        run: python3 tests/smoke.py lacron:ci
+      - name: Export image
+        if: github.event_name != 'pull_request'
+        run: docker save lacron:ci | gzip > lacron-image-amd64.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: lacron-linux-amd64
+          path: |
+            bin/lacron-linux-amd64
+            lacron-image-amd64.tar.gz
+          retention-days: 14
