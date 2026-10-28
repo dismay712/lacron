@@ -185,6 +185,8 @@ docker build --pull -t lacron:test .
 python3 tests/smoke.py lacron:test
 ```
 
+CI 还使用 Chromium 验证登录、任务增删改、预设、启停、手动运行、纯文本日志、搜索、主题持久化、移动端导航和退出登录，并上传浅色、深色和移动端截图作为检查记录。Playwright 仅用于测试，不进入运行镜像，也不需要前端构建。
+
 ## 协议
 
 [MIT](LICENSE) © 2026 dismay712。基础镜像、Node.js 和系统软件包保留各自的开源协议。

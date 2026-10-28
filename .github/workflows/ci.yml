@@ -39,6 +39,21 @@ jobs:
         run: docker build --pull --build-arg VERSION="${GITHUB_SHA::12}" -t lacron:ci .
       - name: Exercise real cron and Node in the container
         run: python3 tests/smoke.py lacron:ci
+      - name: Install browser test dependencies
+        run: |
+          npm install --prefix "$RUNNER_TEMP/lacron-ui" --no-package-lock --ignore-scripts --no-audit --no-fund playwright
+          node "$RUNNER_TEMP/lacron-ui/node_modules/playwright/cli.js" install --with-deps chromium
+      - name: Verify WebUI in Chromium
+        env:
+          NODE_PATH: ${{ runner.temp }}/lacron-ui/node_modules
+        run: node tests/ui.cjs lacron:ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lacron-webui-check
+          path: test-results/
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Export image
         if: github.event_name != 'pull_request'
         run: docker save lacron:ci | gzip > lacron-image-amd64.tar.gz

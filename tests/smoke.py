@@ -108,6 +108,10 @@ def main():
         api("/api/jobs", "POST", job, origin="http://evil.test", status=403)
 
         docker("restart", "-t", "10", name)
+        # Docker may allocate a new host port for a dynamically published port
+        # when the container restarts. Resolve it again before checking HTTP.
+        port = docker("port", name, "8080/tcp").stdout.strip().rsplit(":", 1)[1]
+        base = "http://127.0.0.1:" + port
         eventually(lambda: api("/healthz", auth=False))
         persisted = api("/api/jobs")
         assert len(persisted) == 1 and persisted[0]["id"] == jid and not persisted[0]["enabled"]
