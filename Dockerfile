@@ -25,7 +25,7 @@ LABEL org.opencontainers.image.title="lacron" \
       org.opencontainers.image.licenses="MIT"
 ARG EXTRA_APK_PACKAGES=""
 RUN apk upgrade --no-cache \
-    && apk add --no-cache ca-certificates libstdc++ tini tzdata ${EXTRA_APK_PACKAGES} \
+    && apk add --no-cache ca-certificates libatomic libstdc++ tini tzdata ${EXTRA_APK_PACKAGES} \
     && addgroup -g 10001 lacron \
     && adduser -D -H -u 10001 -G lacron -s /sbin/nologin lacron \
     && mkdir -p /data /scripts /run/lacron \

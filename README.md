@@ -53,7 +53,7 @@ Compose 默认时区为 `Asia/Shanghai`，仅绑定宿主机 `127.0.0.1:8080`。
 | JavaScript | `node:lts-alpine` | 官方最新 LTS 及其最新补丁，包含 `node`、`npm`、`npx` |
 | Go 编译 | `golang:alpine` | 编译静态 Go 二进制，前端资源直接嵌入 |
 
-构建时检查 `process.release.lts` 非空，防止误用 Current 版。Node 运行时复制自官方 musl 镜像，最终镜像从 `alpine:latest` 构建并安装 `libstdc++`、CA 证书、时区数据及 `tini`。
+构建时检查 `process.release.lts` 非空，防止误用 Current 版。Node 运行时复制自官方 musl 镜像，最终镜像从 `alpine:latest` 构建并安装 `libstdc++`、`libatomic`、CA 证书、时区数据及 `tini`。
 
 `latest` 和 `lts-alpine` 在**构建时**解析。已运行的容器不会自动升级：
 
