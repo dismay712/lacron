@@ -58,7 +58,7 @@ func ConfigFromEnv() (Config, error) {
 			return Config{}, err
 		}
 	}
-	cfg := Config{DataDir: env("LACRON_DATA_DIR", "/data"), Socket: env("LACRON_SOCKET", "/run/lacron/runner.sock"), Addr: env("LACRON_ADDR", ":8080"), Timezone: env("TZ", "UTC"), Executable: exe, ScriptPath: env("LACRON_SCRIPT_PATH", "/usr/local/bin:/usr/bin:/bin")}
+	cfg := Config{DataDir: env("LACRON_DATA_DIR", "/data"), Socket: env("LACRON_SOCKET", "/run/lacron/runner.sock"), Addr: env("LACRON_ADDR", ":8080"), Timezone: env("TZ", "UTC"), Executable: exe, ScriptPath: env("LACRON_SCRIPT_PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")}
 	for _, path := range []string{cfg.DataDir, cfg.Socket} {
 		if !filepath.IsAbs(path) {
 			return cfg, fmt.Errorf("数据目录与 socket 必须使用绝对路径")
@@ -129,9 +129,6 @@ func newHTTPServer(handler http.Handler) *http.Server {
 }
 
 func Serve(parent context.Context, cfg Config) error {
-	if cfg.CronEnabled && os.Geteuid() != 0 {
-		return errors.New("BusyBox crond 需要 root；开发模式可设置 LACRON_CRON=false")
-	}
 	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
 		return err
 	}
@@ -178,28 +175,20 @@ func Serve(parent context.Context, cfg Config) error {
 	defer tcp.Close()
 	errs := make(chan error, 3)
 	var cronAlive atomic.Bool
-	var cron *exec.Cmd
 	var cronDone chan struct{}
 	if cfg.CronEnabled {
-		cron = exec.CommandContext(ctx, "crond", "-f", "-l", "8", "-L", "/dev/stderr", "-c", s.cronDir())
-		cron.Env = append(os.Environ(), "TZ="+cfg.Timezone, "LACRON_SOCKET="+cfg.Socket)
-		cron.Stdout, cron.Stderr = os.Stdout, os.Stderr
-		if err := cron.Start(); err != nil {
-			return fmt.Errorf("启动 crond: %w", err)
-		}
 		cronAlive.Store(true)
 		cronDone = make(chan struct{})
 		go func() {
-			err := cron.Wait()
-			cronAlive.Store(false)
-			close(cronDone)
-			errs <- fmt.Errorf("crond 已退出: %v", err)
+			defer close(cronDone)
+			defer cronAlive.Store(false)
+			s.schedule(ctx)
 		}()
 	}
 	nodeCtx, stop := context.WithTimeout(ctx, 3*time.Second)
 	node, _ := exec.CommandContext(nodeCtx, "node", "--version").Output()
 	stop()
-	system := map[string]any{"version": Version, "go_version": runtime.Version(), "node_version": strings.TrimSpace(string(node)), "timezone": cfg.Timezone, "cron_enabled": cfg.CronEnabled, "max_concurrent": cfg.MaxConcurrent}
+	system := map[string]any{"version": Version, "go_version": runtime.Version(), "node_version": strings.TrimSpace(string(node)), "timezone": cfg.Timezone, "cron_enabled": cfg.CronEnabled, "max_concurrent": cfg.MaxConcurrent, "scheduler": "go", "schedule_precision": "second", "shell": "/bin/sh"}
 	public := newHTTPServer(s.handler(ctx, token, &cronAlive, system))
 	private := newHTTPServer(s.triggerHandler(ctx))
 	go func() { errs <- public.Serve(tcp) }()

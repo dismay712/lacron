@@ -20,11 +20,12 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
 
 FROM ${ALPINE_IMAGE}
 LABEL org.opencontainers.image.title="lacron" \
-      org.opencontainers.image.description="A lightweight cron manager with a Go WebUI and Node.js LTS" \
+      org.opencontainers.image.description="Second-resolution cron with a Go WebUI, Node.js LTS and Shell scripts" \
       org.opencontainers.image.source="https://github.com/dismay712/lacron" \
       org.opencontainers.image.licenses="MIT"
+ARG EXTRA_APK_PACKAGES=""
 RUN apk upgrade --no-cache \
-    && apk add --no-cache ca-certificates libstdc++ tini tzdata \
+    && apk add --no-cache ca-certificates libstdc++ tini tzdata ${EXTRA_APK_PACKAGES} \
     && addgroup -g 10001 lacron \
     && adduser -D -H -u 10001 -G lacron -s /sbin/nologin lacron \
     && mkdir -p /data /scripts /run/lacron \
@@ -36,12 +37,15 @@ RUN rm -f /usr/local/bin/yarn /usr/local/bin/yarnpkg \
     && node -e 'if (!process.release.lts) throw new Error("Node.js must be an LTS release"); console.log(process.version, process.release.lts)' \
     && npm --version
 COPY --from=build /out/lacron /usr/local/bin/lacron
+COPY docker/entrypoint.sh /usr/local/bin/lacron-entrypoint
+RUN chmod 755 /usr/local/bin/lacron-entrypoint
 COPY scripts/ /scripts/
 COPY LICENSE /usr/share/licenses/lacron/LICENSE
 ENV TZ=UTC LACRON_ADDR=:8080 LACRON_DATA_DIR=/data LACRON_SOCKET=/run/lacron/runner.sock
 WORKDIR /scripts
+USER 0:0
 VOLUME ["/data"]
 EXPOSE 8080
 HEALTHCHECK --interval=15s --timeout=5s --start-period=5s --retries=3 CMD ["/usr/local/bin/lacron", "healthcheck"]
-ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/lacron"]
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/lacron-entrypoint"]
 CMD ["serve"]

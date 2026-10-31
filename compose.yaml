@@ -11,21 +11,12 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       LACRON_TOKEN: ${LACRON_TOKEN:-}
       LACRON_MAX_CONCURRENT: ${LACRON_MAX_CONCURRENT:-4}
+      LACRON_APK_PACKAGES: ${LACRON_APK_PACKAGES:-}
     volumes:
       - lacron-data:/data
       - ./scripts:/scripts:ro
-    read_only: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
-      - /run:rw,noexec,nosuid,size=8m,mode=0755
-    cap_drop:
-      - ALL
-    cap_add:
-      - SETUID
-      - SETGID
-      - KILL
-    security_opt:
-      - no-new-privileges:true
+    # Writable root filesystem and default capabilities allow administrator apk installs.
+    read_only: false
     pids_limit: 256
     stop_grace_period: 15s
 

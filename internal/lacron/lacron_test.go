@@ -67,6 +67,14 @@ func TestSchedule(t *testing.T) {
 		{"0 0 29 2 *", "2026-10-28T00:00:00+08:00", "2028-02-29T00:00:00+08:00"},
 		{"0 0 */2 * *", "2026-10-01T00:00:00+08:00", "2026-10-03T00:00:00+08:00"},
 		{"0 0 * 1 *", "2026-01-31T00:01:00+08:00", "2027-01-01T00:00:00+08:00"},
+		{"* * * * * *", "2026-10-28T09:01:45+08:00", "2026-10-28T09:01:46+08:00"},
+		{"*/5 * * * * *", "2026-10-28T09:01:45+08:00", "2026-10-28T09:01:50+08:00"},
+		{"*/5 * * * * *", "2026-10-28T09:01:59+08:00", "2026-10-28T09:02:00+08:00"},
+		{"15,45 * * * * *", "2026-10-28T09:01:16+08:00", "2026-10-28T09:01:45+08:00"},
+		{"10-20/5 * * * * *", "2026-10-28T09:01:15+08:00", "2026-10-28T09:01:20+08:00"},
+		{"5 0 9 * * 1-5", "2026-10-30T09:00:05+08:00", "2026-11-02T09:00:05+08:00"},
+		{"59 59 23 31 12 *", "2026-12-31T23:59:58+08:00", "2026-12-31T23:59:59+08:00"},
+		{"* * * * *", "2026-10-28T09:01:00+08:00", "2026-10-28T09:02:00+08:00"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.expr+tc.after, func(t *testing.T) {
@@ -84,7 +92,7 @@ func TestSchedule(t *testing.T) {
 			}
 		})
 	}
-	for _, expr := range []string{"", "* * * * * *", "60 * * * *", "0 24 * * *", "0 0 0 * *", "0 0 * 13 *", "0 0 * * 7", "*/0 * * * *", "10-2 * * * *", "*/9999999999 * * * *", "0 0 * * MON", "0 0 * * 1,", "1/2 * * * *", "*;sh * * * *", "+1 * * * *"} {
+	for _, expr := range []string{"", "* * * *", "* * * * * * *", "60 * * * * *", "0 60 * * * *", "*/0 * * * * *", "0 0 24 * * *", "0 0 0 0 * *", "0 0 0 * 13 *", "0 0 0 * * 7", "60 * * * *", "0 24 * * *", "0 0 0 * *", "0 0 * 13 *", "0 0 * * 7", "*/0 * * * *", "10-2 * * * *", "*/9999999999 * * * *", "0 0 * * MON", "0 0 * * 1,", "1/2 * * * *", "*;sh * * * *", "+1 * * * *"} {
 		if _, err := ParseSchedule(expr); err == nil {
 			t.Errorf("accepted invalid expression %q", expr)
 		}
@@ -114,32 +122,40 @@ func TestScheduleDST(t *testing.T) {
 	}
 }
 
-func TestPersistenceAndCronIsolation(t *testing.T) {
+func TestPersistenceAndLegacyCronMigration(t *testing.T) {
 	s, _ := testService(t)
 	in := testInput()
 	in.Command = "echo safe\n* * * * * malicious-command"
 	in.Schedule = "0 0 */2 * *"
 	j := saveTestJob(t, s, in)
-	cronPath := filepath.Join(s.cronDir(), "root")
-	cron, _ := os.ReadFile(cronPath)
-	if strings.Contains(string(cron), "malicious-command") || !strings.Contains(string(cron), "trigger "+j.ID) || !strings.Contains(string(cron), "1,3,5,7") {
-		t.Fatalf("unsafe or incorrect crontab: %s", cron)
+	// Simulate a volume produced by a minute-only version.
+	if err := os.MkdirAll(s.cronDir(), 0700); err != nil {
+		t.Fatal(err)
 	}
-	stat, _ := os.Stat(cronPath)
-	if stat.Mode().Perm() != 0600 {
-		t.Fatalf("crontab mode = %v", stat.Mode())
+	cronPath := filepath.Join(s.cronDir(), "root")
+	if err := os.WriteFile(cronPath, []byte("* * * * * lacron trigger "+j.ID+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.cronDir(), "cron.update"), []byte("root\n"), 0600); err != nil {
+		t.Fatal(err)
 	}
 	reopened, err := Open(s.cfg)
 	if err != nil || len(reopened.Jobs()) != 1 || reopened.Jobs()[0].Command != in.Command {
 		t.Fatalf("persistence: %v", err)
 	}
+	cron, err := os.ReadFile(cronPath)
+	if err != nil || strings.Contains(string(cron), j.ID) || strings.Contains(string(cron), "malicious-command") {
+		t.Fatalf("legacy cron was not disabled: %s, %v", cron, err)
+	}
+	if _, err := os.Stat(filepath.Join(s.cronDir(), "cron.update")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy update file remains: %v", err)
+	}
 	in.Enabled = false
 	if _, err := s.Save(j.ID, in); err != nil {
 		t.Fatal(err)
 	}
-	cron, _ = os.ReadFile(cronPath)
-	if strings.Contains(string(cron), j.ID) {
-		t.Fatal("paused job remains scheduled")
+	if s.Jobs()[0].NextRun != nil {
+		t.Fatal("paused job has a next run")
 	}
 	if err := s.Delete(j.ID); err != nil || len(s.Jobs()) != 0 {
 		t.Fatal(err)
@@ -149,7 +165,7 @@ func TestPersistenceAndCronIsolation(t *testing.T) {
 	}
 }
 
-func TestFailedSaveRollsBackCron(t *testing.T) {
+func TestFailedSavePreservesSchedule(t *testing.T) {
 	s, _ := testService(t)
 	j := saveTestJob(t, s, testInput())
 	path := filepath.Join(s.cfg.DataDir, "jobs.json")
@@ -161,12 +177,12 @@ func TestFailedSaveRollsBackCron(t *testing.T) {
 	}
 	in := testInput()
 	in.Enabled = false
+	in.Schedule = "*/5 * * * * *"
 	if _, err := s.Save(j.ID, in); err == nil {
 		t.Fatal("expected disk error")
 	}
-	cron, _ := os.ReadFile(filepath.Join(s.cronDir(), "root"))
-	if !strings.Contains(string(cron), j.ID) || !s.Jobs()[0].Enabled {
-		t.Fatal("memory and cron must roll back together")
+	if !s.Jobs()[0].Enabled || s.schedules[j.ID].Canonical() != j.Schedule {
+		t.Fatal("failed persistence changed the in-memory job or schedule")
 	}
 }
 

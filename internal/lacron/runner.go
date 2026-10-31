@@ -4,6 +4,7 @@ package lacron
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -46,9 +47,6 @@ func (w *cappedLog) Write(p []byte) (int, error) {
 func (s *Service) Start(ctx context.Context, id, source string) (Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closing {
-		return Run{}, ErrClosing
-	}
 	var job Job
 	for _, j := range s.jobs {
 		if j.ID == id {
@@ -59,12 +57,19 @@ func (s *Service) Start(ctx context.Context, id, source string) (Run, error) {
 	if job.ID == "" {
 		return Run{}, ErrNotFound
 	}
-	// Reject a stale cron trigger after a task has been paused or its schedule
-	// changed. BusyBox reloads at the next minute boundary, not immediately.
+	return s.startLocked(ctx, job, source, time.Now().In(s.location))
+}
+
+// startLocked is shared by manual/local triggers and the scheduler. Checking
+// the current job and reserving the run under one lock makes edits immediate.
+func (s *Service) startLocked(ctx context.Context, job Job, source string, now time.Time) (Run, error) {
+	if s.closing || ctx.Err() != nil {
+		return Run{}, ErrClosing
+	}
+	id := job.ID
 	if source == "cron" {
-		schedule, _ := ParseSchedule(job.Schedule)
-		now := time.Now().In(s.location)
-		if !job.Enabled || !schedule.fields[0][now.Minute()] || !schedule.fields[1][now.Hour()] || !schedule.fields[3][int(now.Month())] || !schedule.matchesDay(now) {
+		last, exists := s.lastScheduled[id]
+		if !job.Enabled || !s.schedules[id].Matches(now) || (exists && last >= now.Unix()) {
 			return Run{}, ErrStale
 		}
 	}
@@ -101,12 +106,48 @@ func (s *Service) Start(ctx context.Context, id, source string) (Run, error) {
 		return Run{}, err
 	}
 	s.runs, s.active[id] = next, true
+	if source == "cron" {
+		s.lastScheduled[id] = now.Unix()
+	}
 	for _, old := range removed {
 		os.Remove(filepath.Join(s.cfg.DataDir, "logs", old.ID+".log"))
 	}
 	s.wg.Add(1)
 	go s.execute(ctx, job, run, f)
 	return run, nil
+}
+
+// dispatchDue never queues missed ticks. The latest persisted configuration is
+// checked while holding the same lock as Save/Delete and run admission.
+func (s *Service) dispatchDue(ctx context.Context, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now = now.In(s.location)
+	for _, job := range s.jobs {
+		if !job.Enabled || !s.schedules[job.ID].Matches(now) {
+			continue
+		}
+		if _, err := s.startLocked(ctx, job, "cron", now); err != nil &&
+			!errors.Is(err, ErrBusy) && !errors.Is(err, ErrStale) && !errors.Is(err, ErrClosing) {
+			log.Printf("schedule job=%s: %v", job.ID, err)
+		}
+	}
+}
+
+func (s *Service) schedule(ctx context.Context) {
+	// Re-align every tick so scheduler work and clock adjustments do not build
+	// up drift. Read time.Now after waking instead of replaying an old timer time.
+	for {
+		now := time.Now()
+		timer := time.NewTimer(time.Until(now.Truncate(time.Second).Add(time.Second)))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			s.dispatchDue(ctx, time.Now())
+		}
+	}
 }
 
 func (s *Service) execute(parent context.Context, job Job, run Run, f *os.File) {

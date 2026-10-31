@@ -19,10 +19,7 @@ async function main() {
   try {
     docker('run', '-d', '--name', name, '-p', '127.0.0.1::8080',
       '-e', `LACRON_TOKEN=${token}`, '-e', 'TZ=Asia/Shanghai',
-      '--read-only', '--tmpfs', '/run:rw,noexec,nosuid,size=8m,mode=0755',
-      '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m,mode=1777',
-      '--cap-drop', 'ALL', '--cap-add', 'SETUID', '--cap-add', 'SETGID', '--cap-add', 'KILL',
-      '--security-opt', 'no-new-privileges:true', process.argv[2] || 'lacron:ci');
+      process.argv[2] || 'lacron:ci');
     const port = docker('port', name, '8080/tcp').split(':').pop();
     const base = `http://127.0.0.1:${port}`;
     let ready = false;
@@ -45,8 +42,8 @@ async function main() {
 
     await page.locator('#new-job').click();
     await page.locator('#job-name').fill('Node.js 状态检查');
-    await page.locator('#schedule-preset').selectOption('0 * * * *');
-    assert.equal(await page.locator('#job-schedule').inputValue(), '0 * * * *');
+    await page.locator('#schedule-preset').selectOption('*/5 * * * * *');
+    assert.equal(await page.locator('#job-schedule').inputValue(), '*/5 * * * * *');
     await page.locator('#job-command').fill("node /scripts/hello.js\nprintf '<script>window.pwned=true</script>\\n'");
     await page.locator('#job-timeout').fill('10');
     await page.locator('#job-enabled').uncheck();
@@ -75,6 +72,7 @@ async function main() {
     await page.locator('#save-job').click();
     await page.locator('#job-dialog').waitFor({ state: 'hidden' });
     await page.locator('#job-rows .job-name').filter({ hasText: 'Node.js 日常检查' }).waitFor();
+    assert.equal(await page.locator('#job-rows .schedule-code').innerText(), '*/5 * * * * *');
     await page.locator('#search').fill('不存在的名称');
     await page.locator('#jobs-empty h2').filter({ hasText: '没有找到匹配的任务。' }).waitFor();
     await page.locator('#search').fill('');

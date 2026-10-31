@@ -79,7 +79,7 @@ function connection(ok) {
 }
 function date(value, long = false) {
   if (!value) return '—';
-  return new Intl.DateTimeFormat('zh-CN', { timeZone: state.system.timezone || 'UTC', ...(long ? { year: 'numeric' } : {}), month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', ...(long ? { second: '2-digit' } : {}), hour12: false }).format(new Date(value));
+  return new Intl.DateTimeFormat('zh-CN', { timeZone: state.system.timezone || 'UTC', ...(long ? { year: 'numeric' } : {}), month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(value));
 }
 function duration(run) {
   const seconds = Math.max(0, ((run.finished_at ? new Date(run.finished_at) : new Date()) - new Date(run.started_at)) / 1000);
@@ -118,7 +118,7 @@ function renderOverview() {
   $('runtime-node').textContent = state.system.node_version ? `Node.js ${state.system.node_version}` : 'Node.js 未安装';
   $('runtime-timezone').textContent = state.system.timezone;
   $('runtime-version').textContent = `lacron ${state.system.version}`;
-  $('cron-label').textContent = state.system.cron_enabled ? (state.system.cron_running ? 'Cron 正在运行' : 'Cron 未运行') : '开发模式 · Cron 已关闭';
+  $('cron-label').textContent = state.system.cron_enabled ? (state.system.cron_running ? '秒级调度正在运行' : '调度未运行') : '定时调度已关闭';
   $('cron-dot').classList.toggle('offline', state.system.cron_enabled && !state.system.cron_running);
   $('cron-dot').classList.toggle('paused', !state.system.cron_enabled);
   const selected = $('run-filter').value;
@@ -213,7 +213,7 @@ function editJob(job = null) {
   $('job-dialog-title').textContent = job ? '编辑任务' : '新建任务';
   $('save-job').textContent = job ? '保存更改' : '创建任务';
   $('job-name').value = job?.name || '';
-  $('job-schedule').value = job?.schedule || '*/5 * * * *';
+  $('job-schedule').value = job?.schedule || '0 */5 * * * *';
   $('job-command').value = job?.command || 'node /scripts/hello.js';
   $('job-directory').value = job?.working_dir || '/scripts';
   $('job-timeout').value = job?.timeout_sec || 300;
