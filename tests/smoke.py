@@ -120,12 +120,12 @@ def main():
         shell_job = dict(job, name="Shell second cron", schedule="* * * * * *", command=shell_command, enabled=False)
         api("/api/jobs/" + shell["id"], "PUT", shell_job)
         shell_output = api("/api/runs/" + shell_run["id"] + "/log")["output"]
-        assert "Hello from lacron!" in shell_output and "10001" in shell_output, shell_output
+        assert "Hello from lacron!" in shell_output and "uid=10002 gid=10002" in shell_output, shell_output
         if not readonly:
             assert "bash-ok" in shell_output and "true" in shell_output and "curl" in shell_output, shell_output
         eventually(lambda: not next(j for j in api("/api/jobs") if j["id"] == shell["id"])["running"])
         api("/api/jobs/" + shell["id"], "DELETE", status=204)
-        print("Scheduled sh script and installed package commands under UID 10001: passed", flush=True)
+        print("Scheduled sh script and installed package commands under its isolated UID 10002: passed", flush=True)
 
         # The root supervisor needs CAP_KILL to terminate a different UID.
         # Verify both default capabilities and the optional minimal set.

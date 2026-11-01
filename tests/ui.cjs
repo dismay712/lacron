@@ -77,9 +77,45 @@ async function main() {
     await page.locator('#jobs-empty h2').filter({ hasText: '没有找到匹配的任务。' }).waitFor();
     await page.locator('#search').fill('');
 
+    await page.locator('#nav-variables').click();
+    await page.locator('#variables-view').waitFor({ state: 'visible' });
+    await page.locator('#new-variable').click();
+    await page.locator('#variable-name').fill('CHECKIN_COOKIE');
+    const sampleCookie = 'ui-cookie-example-not-a-real-secret';
+    await page.locator('#variable-value').fill(sampleCookie);
+    await page.locator('#variable-description').fill('签到 Cookie 测试');
+    assert.equal(await page.locator('#variable-job-options input:checked').count(), 0);
+    await page.locator('#save-variable').click();
+    await page.locator('#variable-dialog').waitFor({ state: 'hidden' });
+    await page.locator('#variable-rows .variable-name').filter({ hasText: 'CHECKIN_COOKIE' }).waitFor();
+    assert.equal(await page.locator('#variable-value').inputValue(), '');
+    assert(!(await page.locator('body').innerText()).includes(sampleCookie));
+    assert((await page.locator('#variable-rows .variable-grants').innerText()).includes('未授权'));
+    await page.locator('#variable-rows .edit-variable').click();
+    assert.equal(await page.locator('#variable-value').inputValue(), '', 'secret must not be echoed when editing');
+    await page.locator('#variable-job-options input').first().check();
+    await page.locator('#save-variable').click();
+    await page.locator('#variable-dialog').waitFor({ state: 'hidden' });
+    await page.waitForFunction(() => document.querySelector('#variable-rows .variable-grants').textContent.includes('Node.js 日常检查'));
+    await page.locator('#nav-jobs').click();
+    await page.locator('#job-rows .edit-job').click();
+    assert((await page.locator('#job-variables').innerText()).includes('CHECKIN_COOKIE'));
+    await page.locator('#job-dialog .modal-footer .close-dialog').click();
+    await page.locator('#nav-variables').click();
+    await page.locator('#variable-rows .edit-variable').click();
+    await page.locator('#variable-job-options input').first().uncheck();
+    await page.locator('#save-variable').click();
+    await page.locator('#variable-dialog').waitFor({ state: 'hidden' });
+    await page.waitForFunction(() => document.querySelector('#variable-rows .variable-grants').textContent.includes('未授权'));
+    await page.locator('#variable-search').fill('missing-variable');
+    await page.locator('#variables-empty h2').filter({ hasText: '没有找到匹配的变量。' }).waitFor();
+    await page.locator('#variable-search').fill('');
+
     // system -> light -> dark; verify saved theme and session after reloading.
     await page.locator('#workspace .theme-button').click();
     assert.equal(await page.locator('html').getAttribute('data-theme'), 'light');
+    await page.screenshot({ path: 'test-results/ui-variables-light.png', fullPage: true });
+    await page.locator('#nav-jobs').click();
     await page.screenshot({ path: 'test-results/ui-light.png', fullPage: true });
     await page.locator('#workspace .theme-button').click();
     assert.equal(await page.locator('html').getAttribute('data-theme'), 'dark');
@@ -87,12 +123,23 @@ async function main() {
     await page.locator('#workspace').waitFor({ state: 'visible' });
     assert.equal(await page.locator('html').getAttribute('data-theme'), 'dark');
     await page.screenshot({ path: 'test-results/ui-dark.png', fullPage: true });
+    await page.locator('#nav-variables').click();
+    await page.screenshot({ path: 'test-results/ui-variables-dark.png', fullPage: true });
+    assert(!(await page.locator('body').innerText()).includes(sampleCookie));
 
     await page.setViewportSize({ width: 390, height: 844 });
     await page.locator('.mobile-nav [data-view=runs]').click();
     await page.locator('#runs-view').waitFor({ state: 'visible' });
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'mobile page overflows viewport');
     await page.screenshot({ path: 'test-results/ui-mobile.png', fullPage: true });
+    await page.locator('.mobile-nav [data-view=variables]').click();
+    await page.locator('#variables-view').waitFor({ state: 'visible' });
+    assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'mobile variables page overflows');
+    await page.screenshot({ path: 'test-results/ui-variables-mobile.png', fullPage: true });
+    await page.locator('#variable-rows .delete-variable').click();
+    await page.locator('#confirm-delete').click();
+    await page.locator('#confirm-dialog').waitFor({ state: 'hidden' });
+    await page.waitForFunction(() => document.querySelector('#variables-count').textContent === '共 0 个变量');
     await page.locator('.mobile-nav [data-view=jobs]').click();
     await page.locator('#job-rows .delete-job').click();
     await page.locator('#confirm-delete').click();
@@ -104,7 +151,7 @@ async function main() {
     await page.locator('#login').waitFor({ state: 'visible' });
     assert.equal(await page.evaluate(() => sessionStorage.getItem('lacron-token')), null);
     assert.deepEqual(pageErrors, []);
-    console.log('WebUI: login, CRUD, presets, pause/enable, manual Node run, plain-text logs, search, light/dark persistence, mobile navigation, logout: passed');
+    console.log('WebUI: tasks, variable CRUD, explicit grants/revocation, no secret echo, search, light/dark and mobile variable page, logout: passed');
   } catch (error) {
     if (page) await page.screenshot({ path: 'test-results/ui-failure.png', fullPage: true }).catch(() => {});
     try { console.error(docker('logs', name)); } catch { /* Keep original failure. */ }

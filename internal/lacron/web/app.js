@@ -7,6 +7,7 @@ const paths = {
   x: '<path d="m6 6 12 12M6 18 18 6"/>',
   search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',
   terminal: '<path d="m5 6 6 6-6 6M13 18h6"/>',
+  key: '<circle cx="8" cy="9" r="5"/><path d="m12 13 8 8m-4-4 3-3m-6 0 3-3"/>',
   play: '<path d="m8 4 12 8-12 8z"/>',
   edit: '<path d="m15 5 4 4M4 20l5-1L20 8a2.8 2.8 0 0 0-4-4L5 15z"/>',
   trash: '<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/>',
@@ -46,7 +47,7 @@ document.querySelectorAll('.theme-button').forEach((b) => b.addEventListener('cl
 media.addEventListener('change', applyTheme);
 applyTheme();
 
-const state = { token: storage.get('lacron-token', true) || '', jobs: [], runs: [], system: {}, filter: 'all', view: 'jobs', editing: null, deleting: null, logID: null, refreshing: false };
+const state = { token: storage.get('lacron-token', true) || '', jobs: [], runs: [], variables: [], system: {}, filter: 'all', view: 'jobs', editing: null, editingVariable: null, deleting: null, deletingKind: 'jobs', logID: null, refreshing: false };
 const statusNames = { running: '执行中', success: '成功', failed: '失败', timeout: '已超时', interrupted: '已中断' };
 let toastTimer;
 function toast(message, error = false) {
@@ -91,10 +92,14 @@ function setView(view) {
   state.view = view;
   $('jobs-view').hidden = view !== 'jobs';
   $('runs-view').hidden = view !== 'runs';
+  $('variables-view').hidden = view !== 'variables';
+  $('overview-metrics').hidden = view === 'variables';
+  $('new-job').hidden = view !== 'jobs';
+  $('new-variable').hidden = view !== 'variables';
   document.querySelectorAll('[data-view]').forEach((b) => { b.classList.toggle('selected', b.dataset.view === view); b.setAttribute('aria-current', b.dataset.view === view ? 'page' : 'false'); });
-  $('page-title').textContent = view === 'jobs' ? '任务调度' : '执行记录';
+  $('page-title').textContent = { jobs: '任务调度', runs: '执行记录', variables: '环境变量' }[view];
   $('breadcrumb-current').textContent = $('page-title').textContent;
-  $('page-description').textContent = view === 'jobs' ? '把重复的工作，交给准时的每一次执行。' : '查看每一次运行，了解任务的每一步。';
+  $('page-description').textContent = { jobs: '把重复的工作，交给准时的每一次执行。', runs: '查看每一次运行，了解任务的每一步。', variables: '集中管理 Cookie 与配置，只授权给需要的任务。' }[view];
 }
 document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
 document.querySelectorAll('[data-filter]').forEach((b) => b.addEventListener('click', () => {
@@ -104,6 +109,7 @@ document.querySelectorAll('[data-filter]').forEach((b) => b.addEventListener('cl
 }));
 $('search').addEventListener('input', renderJobs);
 $('run-filter').addEventListener('change', renderRuns);
+$('variable-search').addEventListener('input', renderVariables);
 
 function renderOverview() {
   $('metric-total').textContent = state.jobs.length;
@@ -160,7 +166,7 @@ function renderJobs() {
     row.querySelector('.job-history').addEventListener('click', () => { $('run-filter').value = job.id; renderRuns(); setView('runs'); });
     row.querySelector('.delete-job').disabled = job.running;
     row.querySelector('.delete-job').setAttribute('aria-label', `删除 ${job.name}`);
-    row.querySelector('.delete-job').addEventListener('click', () => { state.deleting = job.id; $('confirm-description').textContent = `将删除「${job.name}」。此操作无法撤销。`; setError('delete-error', ''); $('confirm-dialog').showModal(); });
+    row.querySelector('.delete-job').addEventListener('click', () => confirmDelete('jobs', job));
     hydrateIcons(row); fragment.append(row);
   }
   $('job-rows').replaceChildren(fragment);
@@ -197,10 +203,10 @@ async function refresh() {
   if (!token) throw new Error('请先登录');
   if (state.refreshing && state.refreshing.token === token) return state.refreshing.promise;
   const promise = (async () => {
-    const [jobs, runs, system] = await Promise.all([api('/jobs'), api('/runs'), api('/system')]);
+    const [jobs, runs, system, variables] = await Promise.all([api('/jobs'), api('/runs'), api('/system'), api('/variables')]);
     if (state.token !== token) throw new Error('登录会话已更改');
-    state.jobs = jobs; state.runs = runs; state.system = system;
-    renderOverview(); renderJobs(); renderRuns(); connection(true);
+    state.jobs = jobs; state.runs = runs; state.system = system; state.variables = variables;
+    renderOverview(); renderJobs(); renderRuns(); renderVariables(); connection(true);
     if ($('log-dialog').open) await updateLog();
   })();
   state.refreshing = { token, promise };
@@ -218,6 +224,9 @@ function editJob(job = null) {
   $('job-directory').value = job?.working_dir || '/scripts';
   $('job-timeout').value = job?.timeout_sec || 300;
   $('job-enabled').checked = job?.enabled ?? true;
+  const granted = state.variables.filter((v) => v.job_ids.includes(job?.id)).map((v) => v.name);
+  $('job-variables').textContent = granted.length ? granted.join('、') : '无。在环境变量页面勾选此任务后生效。';
+  $('job-identity').textContent = job ? `运行身份 UID ${job.run_uid} / GID ${job.run_gid}。可写目录需允许此身份访问。` : '保存后分配独立的任务运行身份。';
   setError('job-error', '');
   $('job-dialog').showModal();
 }
@@ -234,7 +243,78 @@ $('job-form').addEventListener('submit', async (event) => {
 });
 $('confirm-delete').addEventListener('click', async () => {
   $('confirm-delete').disabled = true;
-  try { await api(`/jobs/${state.deleting}`, { method: 'DELETE' }); $('confirm-dialog').close(); toast('任务已删除'); await refresh(); } catch (error) { setError('delete-error', error.message); } finally { $('confirm-delete').disabled = false; }
+  try { await api(`/${state.deletingKind}/${state.deleting}`, { method: 'DELETE' }); $('confirm-dialog').close(); toast(state.deletingKind === 'jobs' ? '任务已删除' : '变量已删除'); await refresh(); } catch (error) { setError('delete-error', error.message); } finally { $('confirm-delete').disabled = false; }
+});
+
+function confirmDelete(kind, item) {
+  state.deletingKind = kind; state.deleting = item.id;
+  const variable = kind === 'variables';
+  $('confirm-title').textContent = variable ? '删除这个变量？' : '删除这个任务？';
+  $('confirm-delete').textContent = variable ? '删除变量' : '删除任务';
+  $('confirm-description').textContent = `将删除「${item.name}」。此操作无法撤销。`;
+  $('confirm-note').textContent = variable ? '后续运行不再注入此变量，已经运行的进程保持原有环境。' : '删除后将停止调度，已有执行记录会继续保留。';
+  setError('delete-error', ''); $('confirm-dialog').showModal();
+}
+
+function renderVariables() {
+  const query = $('variable-search').value.trim().toLocaleLowerCase();
+  const variables = state.variables.filter((v) => `${v.name} ${v.description}`.toLocaleLowerCase().includes(query));
+  const fragment = document.createDocumentFragment();
+  for (const variable of variables) {
+    const row = $('variable-row-template').content.cloneNode(true);
+    row.querySelector('.variable-name').textContent = variable.name;
+    row.querySelector('.variable-description').textContent = variable.description || '无描述';
+    const grants = state.jobs.filter((j) => variable.job_ids.includes(j.id)).map((j) => j.name);
+    row.querySelector('.variable-grants').textContent = grants.length ? grants.join('、') : '未授权任何任务';
+    row.querySelector('.variable-updated').textContent = date(variable.updated_at);
+    row.querySelector('.edit-variable').setAttribute('aria-label', `编辑变量 ${variable.name}`);
+    row.querySelector('.edit-variable').addEventListener('click', () => editVariable(variable));
+    row.querySelector('.delete-variable').setAttribute('aria-label', `删除变量 ${variable.name}`);
+    row.querySelector('.delete-variable').addEventListener('click', () => confirmDelete('variables', variable));
+    hydrateIcons(row); fragment.append(row);
+  }
+  $('variable-rows').replaceChildren(fragment);
+  $('variables-table').hidden = !variables.length;
+  $('variables-empty').hidden = !!variables.length;
+  $('variables-empty').querySelector('h2').textContent = state.variables.length ? '没有找到匹配的变量。' : '配置一次，按需授权。';
+  $('empty-new-variable').hidden = !!state.variables.length;
+  $('variables-count').textContent = `共 ${state.variables.length} 个变量`;
+}
+
+function editVariable(variable = null) {
+  state.editingVariable = variable?.id || null;
+  $('variable-form').reset();
+  $('variable-dialog-title').textContent = variable ? '编辑变量与授权' : '新建变量';
+  $('save-variable').textContent = variable ? '保存更改' : '创建变量';
+  $('variable-name').value = variable?.name || '';
+  $('variable-description').value = variable?.description || '';
+  $('variable-value').required = !variable;
+  $('variable-value').placeholder = variable ? '留空保留原值；输入新值则替换' : '粘贴 Cookie 或其他配置值';
+  $('variable-value-help').textContent = variable ? '已有值不回显。仅修改授权时，变量值留空即可。' : '保存后不回显变量值。';
+  const options = $('variable-job-options'); options.replaceChildren();
+  for (const job of state.jobs) {
+    const label = document.createElement('label'); label.className = 'grant-option';
+    const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.value = job.id; checkbox.checked = !!variable?.job_ids.includes(job.id);
+    const text = document.createElement('span'); const name = document.createElement('strong'); name.textContent = job.name;
+    const command = document.createElement('code'); command.textContent = job.command.replace(/\s+/g, ' ');
+    text.append(name, command); label.append(checkbox, text); options.append(label);
+  }
+  if (!state.jobs.length) { const p = document.createElement('p'); p.className = 'field-help'; p.textContent = '尚无任务。可先保存变量，再创建任务并回来授权。'; options.append(p); }
+  updateGrantCount(); setError('variable-error', ''); $('variable-dialog').showModal();
+}
+function updateGrantCount() { $('variable-grant-count').textContent = `已选择 ${$('variable-job-options').querySelectorAll('input:checked').length} 项`; }
+$('variable-job-options').addEventListener('change', updateGrantCount);
+$('new-variable').addEventListener('click', () => editVariable());
+$('empty-new-variable').addEventListener('click', () => editVariable());
+$('variable-dialog').addEventListener('close', () => { $('variable-value').value = ''; });
+$('variable-form').addEventListener('submit', async (event) => {
+  event.preventDefault(); $('save-variable').disabled = true; setError('variable-error', '');
+  const input = { name: $('variable-name').value, description: $('variable-description').value, job_ids: [...$('variable-job-options').querySelectorAll('input:checked')].map((c) => c.value) };
+  if (!state.editingVariable || $('variable-value').value !== '') input.value = $('variable-value').value;
+  try {
+    await api(state.editingVariable ? `/variables/${state.editingVariable}` : '/variables', { method: state.editingVariable ? 'PUT' : 'POST', body: JSON.stringify(input) });
+    $('variable-dialog').close(); toast('变量与授权已保存'); await refresh();
+  } catch (error) { setError('variable-error', error.message); } finally { $('save-variable').disabled = false; }
 });
 async function openLog(id) {
   state.logID = id;

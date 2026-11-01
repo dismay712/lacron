@@ -129,6 +129,9 @@ func newHTTPServer(handler http.Handler) *http.Server {
 }
 
 func Serve(parent context.Context, cfg Config) error {
+	// Task-created files default to owner-only access, so credentials are not
+	// accidentally exposed via ordinary temporary files shared across UIDs.
+	syscall.Umask(0077)
 	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
 		return err
 	}

@@ -38,6 +38,7 @@ type Job struct {
 	Enabled    bool      `json:"enabled"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+	RunSlot    uint32    `json:"run_slot"`
 }
 
 type JobInput struct {
@@ -54,6 +55,8 @@ type JobView struct {
 	Running bool       `json:"running"`
 	NextRun *time.Time `json:"next_run"`
 	LastRun *Run       `json:"last_run,omitempty"`
+	RunUID  uint32     `json:"run_uid"`
+	RunGID  uint32     `json:"run_gid"`
 }
 
 type Run struct {
@@ -79,6 +82,8 @@ type Service struct {
 	location      *time.Location
 	schedules     map[string]Schedule
 	lastScheduled map[string]int64
+	variables     []Variable
+	retiredSlots  map[uint32]bool
 }
 
 func newID() string {
@@ -90,11 +95,14 @@ func newID() string {
 }
 
 func Open(cfg Config) (*Service, error) {
+	if cfg.RunUID == 0 || cfg.RunGID == 0 || cfg.RunUID > ^uint32(0)-maxJobs || cfg.RunGID > ^uint32(0)-maxJobs {
+		return nil, fmt.Errorf("任务 UID/GID 起始值必须为非零值，且能容纳 %d 个隔离身份", maxJobs)
+	}
 	loc, err := time.LoadLocation(cfg.Timezone)
 	if err != nil {
 		return nil, fmt.Errorf("TZ: %w", err)
 	}
-	s := &Service{cfg: cfg, jobs: []Job{}, runs: []Run{}, active: map[string]bool{}, location: loc, schedules: map[string]Schedule{}, lastScheduled: map[string]int64{}}
+	s := &Service{cfg: cfg, jobs: []Job{}, runs: []Run{}, active: map[string]bool{}, location: loc, schedules: map[string]Schedule{}, lastScheduled: map[string]int64{}, retiredSlots: map[uint32]bool{}}
 	for _, dir := range []string{cfg.DataDir, filepath.Join(cfg.DataDir, "logs")} {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, err
@@ -122,6 +130,12 @@ func Open(cfg Config) (*Service, error) {
 			return nil, fmt.Errorf("jobs.json: %w", err)
 		}
 		s.schedules[j.ID], _ = ParseSchedule(j.Schedule)
+	}
+	if err := s.migrateJobSlots(); err != nil {
+		return nil, err
+	}
+	if err := s.loadVariables(); err != nil {
+		return nil, err
 	}
 	if err := readJSON(filepath.Join(cfg.DataDir, "runs.json"), &s.runs); err != nil {
 		return nil, err
@@ -255,6 +269,11 @@ func (s *Service) commitJobs(next []Job) error {
 	if err := writeJSON(filepath.Join(s.cfg.DataDir, "jobs.json"), next); err != nil {
 		return err
 	}
+	for _, old := range s.jobs {
+		if _, exists := compiled[old.ID]; !exists {
+			s.retiredSlots[old.RunSlot] = true
+		}
+	}
 	s.jobs, s.schedules = next, compiled
 	for id := range s.lastScheduled {
 		if _, exists := compiled[id]; !exists {
@@ -282,12 +301,17 @@ func (s *Service) Save(id string, input JobInput) (Job, error) {
 			return Job{}, fmt.Errorf("%w：最多支持 %d 个任务", ErrInvalid, maxJobs)
 		}
 		j.ID = newID()
+		j.RunSlot = freeRunSlot(next, s.retiredSlots)
+		if j.RunSlot == 0 {
+			return Job{}, fmt.Errorf("%w：本次容器运行的隔离身份已用尽，请重启容器释放已删除任务的身份", ErrBusy)
+		}
 		next = append(next, j)
 	} else {
 		found := false
 		for i := range next {
 			if next[i].ID == id {
 				j.CreatedAt = next[i].CreatedAt
+				j.RunSlot = next[i].RunSlot
 				next[i], found = j, true
 				break
 			}
@@ -326,7 +350,8 @@ func (s *Service) Jobs() []JobView {
 	defer s.mu.Unlock()
 	views := make([]JobView, 0, len(s.jobs))
 	for _, j := range s.jobs {
-		v := JobView{Job: j, Running: s.active[j.ID]}
+		uid, gid := s.jobIdentity(j)
+		v := JobView{Job: j, Running: s.active[j.ID], RunUID: uid, RunGID: gid}
 		if j.Enabled {
 			schedule := s.schedules[j.ID]
 			if next := schedule.Next(time.Now().In(s.location)); !next.IsZero() {

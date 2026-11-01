@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
 )
@@ -61,6 +62,42 @@ func decodeJob(w http.ResponseWriter, r *http.Request) (JobInput, error) {
 
 func (s *Service) handler(ctx context.Context, token string, cronAlive *atomic.Bool, system map[string]any) http.Handler {
 	api := http.NewServeMux()
+	api.HandleFunc("GET /api/variables", func(w http.ResponseWriter, r *http.Request) {
+		respond(w, http.StatusOK, s.Variables())
+	})
+	saveVariable := func(w http.ResponseWriter, r *http.Request) {
+		if os.Geteuid() != 0 {
+			problem(w, http.StatusForbidden, "环境变量隔离需要服务以容器内 root 运行（Podman --user 0:0）")
+			return
+		}
+		var input VariableInput
+		r.Body = http.MaxBytesReader(w, r.Body, 128<<10)
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil || decoder.Decode(new(any)) != io.EOF {
+			problem(w, http.StatusBadRequest, "JSON 格式无效或请求过大")
+			return
+		}
+		v, err := s.SaveVariable(r.PathValue("id"), input)
+		if err != nil {
+			apiError(w, err)
+			return
+		}
+		status := http.StatusOK
+		if r.Method == http.MethodPost {
+			status = http.StatusCreated
+		}
+		respond(w, status, v)
+	}
+	api.HandleFunc("POST /api/variables", saveVariable)
+	api.HandleFunc("PUT /api/variables/{id}", saveVariable)
+	api.HandleFunc("DELETE /api/variables/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.DeleteVariable(r.PathValue("id")); err != nil {
+			apiError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	api.HandleFunc("GET /api/system", func(w http.ResponseWriter, r *http.Request) {
 		data := map[string]any{}
 		for key, value := range system {

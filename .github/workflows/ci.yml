@@ -43,6 +43,10 @@ jobs:
           -t lacron:ci .
       - name: Exercise second cron, Node, sh and apk package installation
         run: python3 tests/smoke.py lacron:ci
+      - name: Verify Cookie check-in workflow and isolated variable grants
+        run: |
+          docker run --rm --entrypoint node -v "$PWD/tests:/tests:ro" -v "$PWD/scripts:/scripts:ro" lacron:ci --test /tests/checkin.test.cjs
+          python3 tests/variables.py lacron:ci
       - name: Verify optional read-only runtime
         run: python3 tests/smoke.py lacron:ci --read-only
       - name: Install browser test dependencies

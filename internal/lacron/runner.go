@@ -76,6 +76,10 @@ func (s *Service) startLocked(ctx context.Context, job Job, source string, now t
 	if s.active[id] || len(s.active) >= s.cfg.MaxConcurrent {
 		return Run{}, ErrBusy
 	}
+	if len(s.variables) > 0 && os.Geteuid() != 0 {
+		return Run{}, fmt.Errorf("%w：已配置环境变量，需要以容器内 root 运行服务，以隔离不同任务的运行身份", ErrInvalid)
+	}
+	environment := s.jobEnvironment(job)
 	run := Run{ID: newID(), JobID: job.ID, JobName: job.Name, Source: source, Status: "running", StartedAt: time.Now().UTC()}
 	f, err := os.OpenFile(filepath.Join(s.cfg.DataDir, "logs", run.ID+".log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
@@ -113,7 +117,7 @@ func (s *Service) startLocked(ctx context.Context, job Job, source string, now t
 		os.Remove(filepath.Join(s.cfg.DataDir, "logs", old.ID+".log"))
 	}
 	s.wg.Add(1)
-	go s.execute(ctx, job, run, f)
+	go s.execute(ctx, job, run, f, environment)
 	return run, nil
 }
 
@@ -150,7 +154,7 @@ func (s *Service) schedule(ctx context.Context) {
 	}
 }
 
-func (s *Service) execute(parent context.Context, job Job, run Run, f *os.File) {
+func (s *Service) execute(parent context.Context, job Job, run Run, f *os.File, environment []string) {
 	defer s.wg.Done()
 	ctx, cancel := context.WithTimeout(parent, time.Duration(job.TimeoutSec)*time.Second)
 	defer cancel()
@@ -159,11 +163,12 @@ func (s *Service) execute(parent context.Context, job Job, run Run, f *os.File) 
 	cmd.Dir = job.WorkingDir
 	// Do not pass the admin token, cloud credentials, or server configuration to
 	// scripts. Operators can explicitly source their own mounted secrets.
-	cmd.Env = []string{"PATH=" + s.cfg.ScriptPath, "HOME=/tmp", "USER=lacron", "LOGNAME=lacron", "LANG=C.UTF-8", "TZ=" + s.cfg.Timezone}
+	cmd.Env = environment
 	cmd.Stdout, cmd.Stderr = output, output
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if os.Geteuid() == 0 {
-		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: s.cfg.RunUID, Gid: s.cfg.RunGID, Groups: []uint32{}}
+		uid, gid := s.jobIdentity(job)
+		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{}}
 	}
 	// Kill the process group, including Node/shell children, on timeout/shutdown.
 	cmd.Cancel = func() error {
