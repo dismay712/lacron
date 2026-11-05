@@ -72,8 +72,20 @@ def main():
         lts = docker("exec", name, "node", "-p", "process.release.lts").stdout.strip()
         assert lts and lts != "undefined", lts
         alpine = docker("exec", name, "cat", "/etc/alpine-release").stdout.strip()
-        docker("exec", name, "npm", "--version")
+        docker("exec", name, "npx", "--version")
+        docker("exec", name, "sh", "-ec", """
+            work=$(mktemp -d)
+            trap 'rm -rf "$work"' EXIT
+            mkdir "$work/dependency" "$work/project"
+            printf '%s\\n' '{"name":"lacron-smoke-dependency","version":"1.0.0"}' > "$work/dependency/package.json"
+            printf '%s\\n' 'module.exports = "npm-module-ok"' > "$work/dependency/index.js"
+            cd "$work/project"
+            printf '%s\\n' '{"name":"lacron-smoke-project","version":"1.0.0","dependencies":{"lacron-smoke-dependency":"file:../dependency"}}' > package.json
+            npm install --offline --ignore-scripts --no-audit --no-fund --cache "$work/cache"
+            node -e 'if (require("lacron-smoke-dependency") !== "npm-module-ok") process.exit(1)'
+        """)
         print(f"Runtime: Alpine {alpine}, Node {system['node_version']} LTS ({lts})", flush=True)
+        print("Offline npm install and Node module loading: passed", flush=True)
 
         if not readonly:
             for package in ("bash", "curl", "jq"):

@@ -41,12 +41,20 @@ jobs:
           --build-arg VERSION="${GITHUB_SHA::12}"
           --label "org.opencontainers.image.revision=$GITHUB_SHA"
           -t lacron:ci .
+      - name: Build the Node-only target and report image sizes
+        run: |
+          docker build --target runtime --build-arg VERSION="${GITHUB_SHA::12}" -t lacron:runtime-ci .
+          docker run --rm --entrypoint sh lacron:runtime-ci -ec 'node --version && ! command -v npm && ! command -v npx'
+          {
+            printf '## Image sizes (uncompressed bytes)\n\n'
+            docker image inspect --format '{{index .RepoTags 0}}: {{.Size}} bytes' lacron:ci lacron:runtime-ci
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Exercise second cron, Node, sh and apk package installation
         run: python3 tests/smoke.py lacron:ci
       - name: Verify Cookie check-in workflow and isolated variable grants
         run: |
-          docker run --rm --entrypoint node -v "$PWD/tests:/tests:ro" -v "$PWD/scripts:/scripts:ro" lacron:ci --test /tests/checkin.test.cjs
-          python3 tests/variables.py lacron:ci
+          docker run --rm --entrypoint node -v "$PWD/tests:/tests:ro" -v "$PWD/scripts:/scripts:ro" lacron:runtime-ci --test /tests/checkin.test.cjs
+          python3 tests/variables.py lacron:runtime-ci
       - name: Verify optional read-only runtime
         run: python3 tests/smoke.py lacron:ci --read-only
       - name: Install browser test dependencies

@@ -112,7 +112,7 @@ Cron：0 0 8 * * *
 | JavaScript | `node:lts-alpine` | 官方最新 LTS 及其最新补丁，包含 `node`、`npm`、`npx` |
 | Go 编译 | `golang:alpine` | 编译静态 Go 二进制，前端资源直接嵌入 |
 
-构建时检查 `process.release.lts` 非空，防止误用 Current 版。Node 运行时复制自官方 musl 镜像，最终镜像从 `alpine:latest` 构建并安装 `libstdc++`、`libatomic`、CA 证书、时区数据及 `tini`。
+构建时检查 `process.release.lts` 非空。最终镜像基于 `alpine:latest`，安装 `libstdc++`、`libatomic`、CA 证书、时区数据及 `tini`。Node 二进制来自官方 musl 镜像，构建时移除本地符号和调试信息。默认镜像保留 `node`、`nodejs`、`npm`、`npx`、npm 自带依赖及许可文件。Node 编译头文件和裁剪工具留在构建阶段。
 
 `latest` 和 `lts-alpine` 在**构建时**解析。已运行的容器不会自动升级：
 
@@ -204,6 +204,25 @@ docker build --pull \
 ```
 
 Dockerfile 支持 Buildx 的 `linux/amd64`、`linux/arm64` 目标；CI 实际运行验证 amd64。其他架构须确认相应官方基础镜像可用。
+
+签到示例等只使用 Node 内置模块的任务可以构建 `runtime` 目标，省去 npm 和 npx：
+
+```sh
+podman build --pull --target runtime -t lacron:runtime .
+```
+
+默认的 `standard` 目标适合需要安装第三方模块的任务。构建带脚本的派生镜像时，可以用 `package-lock.json` 固定依赖，在同一层安装生产依赖并清理 npm 缓存：
+
+```dockerfile
+FROM ghcr.io/dismay712/lacron:latest
+WORKDIR /scripts
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --cache /tmp/npm-cache \
+    && rm -rf /tmp/npm-cache
+COPY my-task.js ./
+```
+
+需要编译原生扩展时，请在构建阶段使用与目标运行时版本匹配的 Node 头文件。需要本地符号进行原生调试时，使用同版本的官方 Node 二进制。
 
 ## 调度规则
 
