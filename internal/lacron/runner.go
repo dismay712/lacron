@@ -4,12 +4,12 @@ package lacron
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -22,6 +22,7 @@ const maxLogBytes = 256 << 10
 type cappedLog struct {
 	mu        sync.Mutex
 	f         *os.File
+	limit     int
 	written   int
 	truncated bool
 }
@@ -30,7 +31,7 @@ func (w *cappedLog) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	n := len(p)
-	remaining := maxLogBytes - w.written
+	remaining := w.limit - w.written
 	if len(p) > remaining {
 		p, w.truncated = p[:remaining], true
 	}
@@ -44,24 +45,48 @@ func (w *cappedLog) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func (s *Service) Start(ctx context.Context, id, source string) (Run, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var job Job
-	for _, j := range s.jobs {
-		if j.ID == id {
-			job = j
-			break
-		}
-	}
-	if job.ID == "" {
-		return Run{}, ErrNotFound
-	}
-	return s.startLocked(ctx, job, source, time.Now().In(s.location))
+var (
+	errStopped  = errors.New("run stopped by administrator")
+	errShutdown = errors.New("service shutdown")
+	errTimeout  = errors.New("run timed out")
+)
+
+type activeRun struct {
+	id     string
+	cancel context.CancelCauseFunc
 }
 
-// startLocked is shared by manual/local triggers and the scheduler. Checking
-// the current job and reserving the run under one lock makes edits immediate.
+func (s *Service) Start(ctx context.Context, id, source string) (Run, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	for _, job := range s.jobs {
+		if job.ID == id {
+			return s.startLocked(ctx, job, source, time.Now().In(s.location))
+		}
+	}
+	return Run{}, ErrNotFound
+}
+
+func (s *Service) StopRun(id string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.closing {
+		return ErrClosing
+	}
+	index, ok := s.runIndex[id]
+	if !ok {
+		return ErrNotFound
+	}
+	active, ok := s.active[s.runs[index].JobID]
+	if !ok || active.id != id {
+		return fmt.Errorf("%w：此执行已结束", ErrStale)
+	}
+	active.cancel(errStopped)
+	return nil
+}
+
+// startLocked serializes admission, edits and persisted run transitions without
+// blocking snapshots during a database write.
 func (s *Service) startLocked(ctx context.Context, job Job, source string, now time.Time) (Run, error) {
 	if s.closing || ctx.Err() != nil {
 		return Run{}, ErrClosing
@@ -73,7 +98,7 @@ func (s *Service) startLocked(ctx context.Context, job Job, source string, now t
 			return Run{}, ErrStale
 		}
 	}
-	if s.active[id] || len(s.active) >= s.cfg.MaxConcurrent {
+	if _, running := s.active[id]; running || len(s.active) >= s.settings.MaxConcurrent {
 		return Run{}, ErrBusy
 	}
 	if len(s.variables) > 0 && os.Geteuid() != 0 {
@@ -81,51 +106,44 @@ func (s *Service) startLocked(ctx context.Context, job Job, source string, now t
 	}
 	environment := s.jobEnvironment(job)
 	run := Run{ID: newID(), JobID: job.ID, JobName: job.Name, Source: source, Status: "running", StartedAt: time.Now().UTC()}
-	f, err := os.OpenFile(filepath.Join(s.cfg.DataDir, "logs", run.ID+".log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(s.logPath(run.ID), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return Run{}, err
 	}
-	next := append(append([]Run{}, s.runs...), run)
-	// Never prune an active run: its completion still needs its history entry.
-	var removed []Run
-	for len(next) > maxRuns {
-		found := false
-		for i, old := range next {
-			if old.Status != "running" {
-				removed = append(removed, old)
-				next = append(next[:i], next[i+1:]...)
-				found = true
-				break
-			}
-		}
-		if !found {
-			f.Close()
-			os.Remove(f.Name())
-			return Run{}, ErrBusy
-		}
-	}
-	if err := writeJSON(filepath.Join(s.cfg.DataDir, "runs.json"), next); err != nil {
+	// Appending only touches an element outside the readers' published slice.
+	next, removed := trimHistory(append(s.runs, run), s.settings.MaxRuns)
+	if err := s.persistRun(run, removed); err != nil {
 		f.Close()
 		os.Remove(f.Name())
 		return Run{}, err
 	}
-	s.runs, s.active[id] = next, true
+	runContext, stop := context.WithCancelCause(ctx)
+	s.mu.Lock()
+	s.active[id] = activeRun{id: run.ID, cancel: stop}
 	if source == "cron" {
 		s.lastScheduled[id] = now.Unix()
 	}
-	for _, old := range removed {
-		os.Remove(filepath.Join(s.cfg.DataDir, "logs", old.ID+".log"))
+	if len(removed) == 0 {
+		s.runIndex[run.ID] = len(s.runs)
+		s.lastRunByJob[id] = run
+		s.runs = next
+		s.changes.Runs++
+		s.changes.Jobs++
+	} else {
+		s.publishRuns(next)
 	}
+	s.mu.Unlock()
+	s.removeLogs(removed)
 	s.wg.Add(1)
-	go s.execute(ctx, job, run, f, environment)
+	go s.execute(runContext, stop, job, run, f, environment, s.settings.MaxLogKiB<<10)
 	return run, nil
 }
 
-// dispatchDue never queues missed ticks. The latest persisted configuration is
-// checked while holding the same lock as Save/Delete and run admission.
+// dispatchDue takes the writer lock so a deleted or edited job cannot race
+// with admission. Missed ticks are skipped as before.
 func (s *Service) dispatchDue(ctx context.Context, now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	now = now.In(s.location)
 	for _, job := range s.jobs {
 		if !job.Enabled || !s.schedules[job.ID].Matches(now) {
@@ -154,11 +172,12 @@ func (s *Service) schedule(ctx context.Context) {
 	}
 }
 
-func (s *Service) execute(parent context.Context, job Job, run Run, f *os.File, environment []string) {
+func (s *Service) execute(parent context.Context, stop context.CancelCauseFunc, job Job, run Run, f *os.File, environment []string, logLimit int) {
 	defer s.wg.Done()
-	ctx, cancel := context.WithTimeout(parent, time.Duration(job.TimeoutSec)*time.Second)
+	defer stop(nil)
+	ctx, cancel := context.WithTimeoutCause(parent, time.Duration(job.TimeoutSec)*time.Second, errTimeout)
 	defer cancel()
-	output := &cappedLog{f: f}
+	output := &cappedLog{f: f, limit: logLimit}
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", job.Command)
 	cmd.Dir = job.WorkingDir
 	// Do not pass the admin token, cloud credentials, or server configuration to
@@ -180,12 +199,14 @@ func (s *Service) execute(parent context.Context, job Job, run Run, f *os.File, 
 	}
 	cmd.WaitDelay = 2 * time.Second
 	err := cmd.Run()
+	cause := context.Cause(ctx)
+	cancel()
 	// Also reap descendants left behind by commands that background a child.
 	if cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
-	now, code := time.Now().UTC(), 0
-	run.FinishedAt, run.ExitCode = &now, &code
+	code := 0
+	run.ExitCode = &code
 	run.Status = "success"
 	if err != nil {
 		code, run.Status = -1, "failed"
@@ -194,39 +215,85 @@ func (s *Service) execute(parent context.Context, job Job, run Run, f *os.File, 
 		}
 		fmt.Fprintf(output, "\n[lacron] %v\n", err)
 	}
-	if ctx.Err() != nil {
-		if parent.Err() != nil {
-			run.Status = "interrupted"
-		} else {
-			run.Status = "timeout"
-		}
-	}
 	run.Truncated = output.truncated
 	if run.Truncated {
 		// The UI shows the truncation marker separately from the bounded log.
-		log.Printf("run %s: output truncated at %d bytes", run.ID, maxLogBytes)
+		log.Printf("run %s: output truncated at %d bytes", run.ID, logLimit)
 	}
 	if err := f.Close(); err != nil {
 		log.Printf("run %s close log: %v", run.ID, err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.active, job.ID)
-	for i := range s.runs {
-		if s.runs[i].ID == run.ID {
-			s.runs[i] = run
-			break
-		}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if cause == nil && context.Cause(parent) == errStopped {
+		cause = errStopped
 	}
-	if err := writeJSON(filepath.Join(s.cfg.DataDir, "runs.json"), s.runs); err != nil {
+	switch cause {
+	case errStopped:
+		run.Status = "cancelled"
+	case errTimeout, context.DeadlineExceeded:
+		run.Status = "timeout"
+	case nil:
+	default:
+		run.Status = "interrupted"
+	}
+	now := time.Now().UTC()
+	run.FinishedAt = &now
+	index := s.runIndex[run.ID]
+	var retained, removed []Run
+	if len(s.runs) > s.settings.MaxRuns {
+		next := append([]Run{}, s.runs...)
+		next[index] = run
+		retained, removed = trimHistory(next, s.settings.MaxRuns)
+	}
+	if err := s.persistRun(run, removed); err != nil {
+		// The process has exited. Release its admission slot and keep the log
+		// even if durable completion fails. Startup repairs the old running row.
 		log.Printf("persist run %s: %v", run.ID, err)
+		removed = nil
 	}
+	s.mu.Lock()
+	delete(s.active, job.ID)
+	if len(removed) == 0 {
+		s.runs[index] = run
+		s.lastRunByJob[job.ID] = run
+		s.completedRuns++
+		if run.Status == "success" {
+			s.successfulRuns++
+		}
+		s.changes.Runs++
+		s.changes.Jobs++
+	} else {
+		s.publishRuns(retained)
+	}
+	s.mu.Unlock()
+	s.removeLogs(removed)
 	log.Printf("run %s job=%s source=%s status=%s exit=%d", run.ID, job.ID, run.Source, run.Status, code)
 }
 
+func (s *Service) persistRun(run Run, removed []Run) error {
+	if len(removed) == 0 {
+		return writeRow(s.db, saveRunRow, run.ID, run)
+	}
+	return s.transaction(func(tx *sql.Tx) error {
+		if err := writeRow(tx, saveRunRow, run.ID, run); err != nil {
+			return err
+		}
+		return deleteRunRows(tx, removed)
+	})
+}
+
 func (s *Service) Close() {
-	s.mu.Lock()
-	s.closing = true
-	s.mu.Unlock()
-	s.wg.Wait()
+	s.closeOnce.Do(func() {
+		s.writeMu.Lock()
+		s.closing = true
+		for _, active := range s.active {
+			active.cancel(errShutdown)
+		}
+		s.writeMu.Unlock()
+		s.wg.Wait()
+		if err := s.db.Close(); err != nil {
+			log.Printf("close database: %v", err)
+		}
+	})
 }

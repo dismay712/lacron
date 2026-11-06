@@ -5,6 +5,7 @@ package lacron
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -26,16 +27,18 @@ import (
 var Version = "dev"
 
 type Config struct {
-	DataDir       string
-	Socket        string
-	Addr          string
-	Timezone      string
-	Executable    string
-	ScriptPath    string
-	RunUID        uint32
-	RunGID        uint32
-	MaxConcurrent int
-	CronEnabled   bool
+	DataDir               string
+	Socket                string
+	Addr                  string
+	Timezone              string
+	Executable            string
+	ScriptPath            string
+	RunUID                uint32
+	RunGID                uint32
+	MaxConcurrent         int
+	CronEnabled           bool
+	EncryptionKey         []byte
+	PreviousEncryptionKey []byte
 }
 
 func env(key, fallback string) string {
@@ -80,6 +83,14 @@ func ConfigFromEnv() (Config, error) {
 	cfg.CronEnabled, err = strconv.ParseBool(env("LACRON_CRON", "true"))
 	if err != nil {
 		return cfg, fmt.Errorf("LACRON_CRON 必须为布尔值")
+	}
+	for name, target := range map[string]*[]byte{"LACRON_ENCRYPTION_KEY": &cfg.EncryptionKey, "LACRON_PREVIOUS_ENCRYPTION_KEY": &cfg.PreviousEncryptionKey} {
+		if encoded := strings.TrimSpace(os.Getenv(name)); encoded != "" {
+			*target, err = base64.StdEncoding.DecodeString(encoded)
+			if err != nil || len(*target) != 32 {
+				return Config{}, fmt.Errorf("%s 须为 32 字节密钥的 Base64 编码", name)
+			}
+		}
 	}
 	return cfg, nil
 }
@@ -147,6 +158,7 @@ func Serve(parent context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	defer s.Close()
 	token, err := loadToken(cfg)
 	if err != nil {
 		return err
@@ -191,7 +203,7 @@ func Serve(parent context.Context, cfg Config) error {
 	nodeCtx, stop := context.WithTimeout(ctx, 3*time.Second)
 	node, _ := exec.CommandContext(nodeCtx, "node", "--version").Output()
 	stop()
-	system := map[string]any{"version": Version, "go_version": runtime.Version(), "node_version": strings.TrimSpace(string(node)), "timezone": cfg.Timezone, "cron_enabled": cfg.CronEnabled, "max_concurrent": cfg.MaxConcurrent, "scheduler": "go", "schedule_precision": "second", "shell": "/bin/sh"}
+	system := map[string]any{"version": Version, "go_version": runtime.Version(), "node_version": strings.TrimSpace(string(node)), "timezone": cfg.Timezone, "cron_enabled": cfg.CronEnabled, "scheduler": "go", "schedule_precision": "second", "shell": "/bin/sh"}
 	public := newHTTPServer(s.handler(ctx, token, &cronAlive, system))
 	private := newHTTPServer(s.triggerHandler(ctx))
 	go func() { errs <- public.Serve(tcp) }()

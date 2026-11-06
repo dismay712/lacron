@@ -1,10 +1,7 @@
 package lacron
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -17,11 +14,11 @@ const maxJobEnvBytes = 64 << 10
 
 var variableNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 
-// Variable values are stored only in a root-owned file, never in API responses.
+// Variable values are encrypted on disk and excluded from API responses.
 type Variable struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
-	Value       string    `json:"value"`
+	Value       string    `json:"value,omitempty"`
 	Description string    `json:"description"`
 	JobIDs      []string  `json:"job_ids"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -72,43 +69,7 @@ func validateVariable(in VariableInput) (VariableInput, error) {
 	return in, nil
 }
 
-func (s *Service) loadVariables() error {
-	s.variables = []Variable{}
-	path := filepath.Join(s.cfg.DataDir, "variables.json")
-	if err := readJSON(path, &s.variables); err != nil {
-		return err
-	}
-	if len(s.variables) > maxVariables {
-		return fmt.Errorf("环境变量超过 %d 个", maxVariables)
-	}
-	ids := map[string]bool{}
-	for _, v := range s.variables {
-		if !idPattern.MatchString(v.ID) || ids[v.ID] {
-			return fmt.Errorf("variables.json 含重复名称或无效 ID")
-		}
-		in, err := validateVariable(VariableInput{v.Name, &v.Value, v.Description, v.JobIDs})
-		if err != nil || in.Name != v.Name {
-			return fmt.Errorf("variables.json 配置无效")
-		}
-		ids[v.ID] = true
-	}
-	if err := checkEnvironmentSize(s.variables); err != nil {
-		return err
-	}
-	// Fix permissions even when a file was restored from a backup.
-	if _, err := os.Stat(path); err == nil {
-		return os.Chmod(path, 0600)
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	return nil
-}
-
 func checkEnvironmentSize(variables []Variable) error {
-	encoded, err := json.MarshalIndent(variables, "", "  ")
-	if err != nil || len(encoded) >= 8<<20 {
-		return fmt.Errorf("环境变量存储总大小不能超过 8 MiB")
-	}
 	sizes := map[string]int{}
 	names := map[string]map[string]bool{}
 	for _, v := range variables {
@@ -140,8 +101,8 @@ func (s *Service) variableView(v Variable) VariableView {
 }
 
 func (s *Service) Variables() []VariableView {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	result := make([]VariableView, 0, len(s.variables))
 	for _, v := range s.variables {
 		result = append(result, s.variableView(v))
@@ -154,8 +115,8 @@ func (s *Service) SaveVariable(id string, input VariableInput) (VariableView, er
 	if err != nil {
 		return VariableView{}, fmt.Errorf("%w：%v", ErrInvalid, err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if s.closing {
 		return VariableView{}, ErrClosing
 	}
@@ -192,16 +153,19 @@ func (s *Service) SaveVariable(id string, input VariableInput) (VariableView, er
 	if err := checkEnvironmentSize(next); err != nil {
 		return VariableView{}, fmt.Errorf("%w：%v", ErrInvalid, err)
 	}
-	if err := writeJSON(filepath.Join(s.cfg.DataDir, "variables.json"), next); err != nil {
+	if err := s.writeVariable(s.db, v); err != nil {
 		return VariableView{}, err
 	}
+	s.mu.Lock()
 	s.variables = next
+	s.changes.Variables++
+	s.mu.Unlock()
 	return s.variableView(v), nil
 }
 
 func (s *Service) DeleteVariable(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if s.closing {
 		return ErrClosing
 	}
@@ -209,17 +173,20 @@ func (s *Service) DeleteVariable(id string) error {
 		if v.ID == id {
 			next := append([]Variable{}, s.variables[:i]...)
 			next = append(next, s.variables[i+1:]...)
-			if err := writeJSON(filepath.Join(s.cfg.DataDir, "variables.json"), next); err != nil {
+			if _, err := s.db.Exec(`DELETE FROM variables WHERE id=?`, id); err != nil {
 				return err
 			}
+			s.mu.Lock()
 			s.variables = next
+			s.changes.Variables++
+			s.mu.Unlock()
 			return nil
 		}
 	}
 	return ErrNotFound
 }
 
-// Called under s.mu. Return a fresh snapshot, never a shared global environment.
+// Called under the writer lock. Return a fresh snapshot, never a shared global environment.
 func (s *Service) jobEnvironment(job Job) []string {
 	result := []string{"PATH=" + s.cfg.ScriptPath, "HOME=/tmp", "USER=lacron", "LOGNAME=lacron", "LANG=C.UTF-8", "TZ=" + s.cfg.Timezone}
 	for _, v := range s.variables {
@@ -253,15 +220,10 @@ func (s *Service) migrateJobSlots() error {
 		}
 		used[j.RunSlot] = true
 	}
-	changed := false
 	for i := range s.jobs {
 		if s.jobs[i].RunSlot == 0 {
 			s.jobs[i].RunSlot = freeRunSlot(s.jobs, nil)
-			changed = true
 		}
-	}
-	if changed {
-		return writeJSON(filepath.Join(s.cfg.DataDir, "jobs.json"), s.jobs)
 	}
 	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func valuePtr(s string) *string { return &s }
@@ -37,17 +38,18 @@ func TestVariablesGrantsPersistenceAndIsolation(t *testing.T) {
 	if strings.Contains(string(encoded), "cookie-a-private") || strings.Contains(string(encoded), `"value":`) {
 		t.Fatal("secret exposed in variable view")
 	}
-	stat, err := os.Stat(filepath.Join(s.cfg.DataDir, "variables.json"))
+	stat, err := os.Stat(filepath.Join(s.cfg.DataDir, "lacron.sqlite3"))
 	if err != nil || stat.Mode().Perm() != 0600 {
 		t.Fatalf("secret file permissions: %v %v", stat, err)
 	}
-	reopened, err := Open(s.cfg)
+	reopened, err := Open(testConfig(s.cfg.DataDir))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(reopened.jobEnvironment(reopened.jobs[0]), "CHECKIN_COOKIE=cookie-a-private") || reopened.jobs[1].RunSlot != b.RunSlot {
 		t.Fatal("grants, values or identities not persisted")
 	}
+	reopened.Close()
 	// Omitted value preserves the secret. Revocation changes subsequent snapshots.
 	if _, err := s.SaveVariable(av.ID, VariableInput{Name: av.Name, Description: "updated", JobIDs: []string{}}); err != nil {
 		t.Fatal(err)
@@ -89,11 +91,9 @@ func TestVariableValidationAndRollback(t *testing.T) {
 	if _, err := s.SaveVariable("", VariableInput{Name: "TOKEN", Value: valuePtr("different"), JobIDs: []string{j.ID}}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("ambiguous same-name grants accepted")
 	}
-	path := filepath.Join(s.cfg.DataDir, "variables.json")
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(path, 0700); err != nil {
+	if _, err := s.db.Exec(`
+		CREATE TRIGGER test_fail_var_save BEFORE UPDATE ON variables BEGIN SELECT RAISE(ABORT,'write failed'); END;
+		CREATE TRIGGER test_fail_var_delete BEFORE DELETE ON variables BEGIN SELECT RAISE(ABORT,'delete failed'); END;`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.SaveVariable(v.ID, VariableInput{Name: "TOKEN", Value: valuePtr("changed")}); err == nil {
@@ -136,16 +136,19 @@ func TestVariableSizeAndDeletedTaskGrants(t *testing.T) {
 }
 
 func TestJobIdentityMigration(t *testing.T) {
-	s, _ := testService(t)
-	a, b := saveTestJob(t, s, testInput()), saveTestJob(t, s, testInput())
-	a.RunSlot, b.RunSlot = 0, 0
-	if err := writeJSON(filepath.Join(s.cfg.DataDir, "jobs.json"), []Job{a, b}); err != nil {
+	now := time.Now()
+	a := Job{ID: newID(), Name: "first", Schedule: "* * * * *", Command: "printf hello", WorkingDir: "/", TimeoutSec: 10, Enabled: true, CreatedAt: now, UpdatedAt: now}
+	b := a
+	b.ID, b.Name = newID(), "second"
+	cfg := testConfig(t.TempDir())
+	if err := writeJSON(filepath.Join(cfg.DataDir, "jobs.json"), []Job{a, b}); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(s.cfg)
+	reopened, err := Open(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(reopened.Close)
 	uidA, _ := reopened.jobIdentity(reopened.jobs[0])
 	uidB, _ := reopened.jobIdentity(reopened.jobs[1])
 	if uidA != 10001 || uidB != 10002 {

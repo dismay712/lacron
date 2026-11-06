@@ -1,7 +1,9 @@
 package lacron
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const maxJobs = 500
@@ -69,21 +72,41 @@ type Run struct {
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	ExitCode   *int       `json:"exit_code,omitempty"`
 	Truncated  bool       `json:"truncated"`
+	LogCleared bool       `json:"log_cleared,omitempty"`
 }
 
 type Service struct {
-	mu            sync.Mutex
-	cfg           Config
-	jobs          []Job
-	runs          []Run
-	active        map[string]bool
-	closing       bool
-	wg            sync.WaitGroup
-	location      *time.Location
-	schedules     map[string]Schedule
-	lastScheduled map[string]int64
-	variables     []Variable
-	retiredSlots  map[uint32]bool
+	// Writers commit to SQLite before publishing the new state. Readers hold
+	// only the snapshot lock, so fsync never delays a list or log read.
+	writeMu        sync.Mutex
+	mu             sync.RWMutex
+	closeOnce      sync.Once
+	db             *sql.DB
+	cipher         cipher.AEAD
+	cfg            Config
+	jobs           []Job
+	runs           []Run
+	runIndex       map[string]int
+	lastRunByJob   map[string]Run
+	completedRuns  int
+	successfulRuns int
+	active         map[string]activeRun
+	closing        bool
+	wg             sync.WaitGroup
+	location       *time.Location
+	schedules      map[string]Schedule
+	lastScheduled  map[string]int64
+	variables      []Variable
+	retiredSlots   map[uint32]bool
+	settings       Settings
+	passkeys       []storedPasskey
+	passkeyUser    string
+	passkeyPolicy  uint64
+	changes        Changes
+}
+
+func (j Job) input() JobInput {
+	return JobInput{j.Name, j.Schedule, j.Command, j.WorkingDir, j.TimeoutSec, j.Enabled}
 }
 
 func newID() string {
@@ -102,7 +125,25 @@ func Open(cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("TZ: %w", err)
 	}
-	s := &Service{cfg: cfg, jobs: []Job{}, runs: []Run{}, active: map[string]bool{}, location: loc, schedules: map[string]Schedule{}, lastScheduled: map[string]int64{}, retiredSlots: map[uint32]bool{}}
+	current, err := variableCipher(cfg.EncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	previous, err := variableCipher(cfg.PreviousEncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	if previous != nil && current == nil {
+		return nil, fmt.Errorf("密钥轮换需要同时配置当前和旧加密密钥")
+	}
+	// Retain only the cipher in the running service.
+	cfg.EncryptionKey, cfg.PreviousEncryptionKey = nil, nil
+	s := &Service{
+		cfg: cfg, cipher: current, jobs: []Job{}, runs: []Run{}, variables: []Variable{},
+		active: map[string]activeRun{}, location: loc, schedules: map[string]Schedule{},
+		lastScheduled: map[string]int64{}, retiredSlots: map[uint32]bool{},
+		settings: defaultSettings(cfg), changes: Changes{Instance: newID()},
+	}
 	for _, dir := range []string{cfg.DataDir, filepath.Join(cfg.DataDir, "logs")} {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, err
@@ -111,54 +152,16 @@ func Open(cfg Config) (*Service, error) {
 			return nil, fmt.Errorf("保护数据目录 %s: %w", dir, err)
 		}
 	}
-	if err := readJSON(filepath.Join(cfg.DataDir, "jobs.json"), &s.jobs); err != nil {
-		return nil, err
+	s.db, err = openDatabase(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("打开 SQLite: %w", err)
 	}
-	if s.jobs == nil {
-		s.jobs = []Job{}
-	}
-	if len(s.jobs) > maxJobs {
-		return nil, fmt.Errorf("最多支持 %d 个任务", maxJobs)
-	}
-	seen := map[string]bool{}
-	for _, j := range s.jobs {
-		if !idPattern.MatchString(j.ID) || seen[j.ID] {
-			return nil, fmt.Errorf("jobs.json 包含重复或无效 ID")
-		}
-		seen[j.ID] = true
-		if _, err := validateJob(JobInput{j.Name, j.Schedule, j.Command, j.WorkingDir, j.TimeoutSec, j.Enabled}); err != nil {
-			return nil, fmt.Errorf("jobs.json: %w", err)
-		}
-		s.schedules[j.ID], _ = ParseSchedule(j.Schedule)
-	}
-	if err := s.migrateJobSlots(); err != nil {
-		return nil, err
-	}
-	if err := s.loadVariables(); err != nil {
-		return nil, err
-	}
-	if err := readJSON(filepath.Join(cfg.DataDir, "runs.json"), &s.runs); err != nil {
-		return nil, err
-	}
-	if s.runs == nil {
-		s.runs = []Run{}
-	}
-	if len(s.runs) > maxRuns {
-		return nil, fmt.Errorf("runs.json 超过保留上限")
-	}
-	for i := range s.runs {
-		if !idPattern.MatchString(s.runs[i].ID) || !idPattern.MatchString(s.runs[i].JobID) {
-			return nil, fmt.Errorf("runs.json 包含无效 ID")
-		}
-		if s.runs[i].Status == "running" {
-			now := time.Now().UTC()
-			s.runs[i].Status, s.runs[i].FinishedAt = "interrupted", &now
-		}
-	}
-	if err := writeJSON(filepath.Join(cfg.DataDir, "runs.json"), s.runs); err != nil {
+	if err := s.loadDatabase(previous); err != nil {
+		s.db.Close()
 		return nil, err
 	}
 	if err := s.disableLegacyCron(); err != nil {
+		s.db.Close()
 		return nil, err
 	}
 	return s, nil
@@ -173,7 +176,14 @@ func readJSON(path string, target any) error {
 		return err
 	}
 	defer f.Close()
-	decoder := json.NewDecoder(io.LimitReader(f, 8<<20))
+	stat, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if stat.Size() > 8<<20 {
+		return fmt.Errorf("旧数据文件 %s 超过 8 MiB", path)
+	}
+	decoder := json.NewDecoder(f)
 	if err := decoder.Decode(target); err != nil {
 		return fmt.Errorf("读取 %s: %w", path, err)
 	}
@@ -200,14 +210,6 @@ func atomicWrite(path string, content []byte) error {
 		return closeErr
 	}
 	return os.Rename(f.Name(), path)
-}
-
-func writeJSON(path string, value any) error {
-	b, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	return atomicWrite(path, append(b, '\n'))
 }
 
 func validateJob(in JobInput) (JobInput, error) {
@@ -257,138 +259,134 @@ func (s *Service) disableLegacyCron() error {
 	return nil
 }
 
-func (s *Service) commitJobs(next []Job) error {
-	compiled := make(map[string]Schedule, len(next))
-	for _, j := range next {
-		parsed, err := ParseSchedule(j.Schedule)
-		if err != nil {
-			return err
-		}
-		compiled[j.ID] = parsed
-	}
-	if err := writeJSON(filepath.Join(s.cfg.DataDir, "jobs.json"), next); err != nil {
-		return err
-	}
-	for _, old := range s.jobs {
-		if _, exists := compiled[old.ID]; !exists {
-			s.retiredSlots[old.RunSlot] = true
-		}
-	}
-	s.jobs, s.schedules = next, compiled
-	for id := range s.lastScheduled {
-		if _, exists := compiled[id]; !exists {
-			delete(s.lastScheduled, id)
-		}
-	}
-	return nil
+func (s *Service) Save(id string, input JobInput) (Job, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.saveJob(id, input)
 }
 
-func (s *Service) Save(id string, input JobInput) (Job, error) {
+// saveJob is called with the writer lock. The prior job configuration remains
+// visible to readers until the replacement row is durable.
+func (s *Service) saveJob(id string, input JobInput) (Job, error) {
 	in, err := validateJob(input)
 	if err != nil {
 		return Job{}, fmt.Errorf("%w：%v", ErrInvalid, err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closing {
 		return Job{}, ErrClosing
 	}
 	now := time.Now().UTC()
-	next := append([]Job{}, s.jobs...)
 	j := Job{ID: id, Name: in.Name, Schedule: in.Schedule, Command: in.Command, WorkingDir: in.WorkingDir, TimeoutSec: in.TimeoutSec, Enabled: in.Enabled, CreatedAt: now, UpdatedAt: now}
+	index := -1
 	if id == "" {
-		if len(next) >= maxJobs {
+		if len(s.jobs) >= maxJobs {
 			return Job{}, fmt.Errorf("%w：最多支持 %d 个任务", ErrInvalid, maxJobs)
 		}
 		j.ID = newID()
-		j.RunSlot = freeRunSlot(next, s.retiredSlots)
+		j.RunSlot = freeRunSlot(s.jobs, s.retiredSlots)
 		if j.RunSlot == 0 {
 			return Job{}, fmt.Errorf("%w：本次容器运行的隔离身份已用尽，请重启容器释放已删除任务的身份", ErrBusy)
 		}
-		next = append(next, j)
 	} else {
-		found := false
-		for i := range next {
-			if next[i].ID == id {
-				j.CreatedAt = next[i].CreatedAt
-				j.RunSlot = next[i].RunSlot
-				next[i], found = j, true
+		for i, old := range s.jobs {
+			if old.ID == id {
+				j.CreatedAt, j.RunSlot, index = old.CreatedAt, old.RunSlot, i
 				break
 			}
 		}
-		if !found {
+		if index == -1 {
 			return Job{}, ErrNotFound
 		}
 	}
-	if err := s.commitJobs(next); err != nil {
+	schedule, _ := ParseSchedule(j.Schedule)
+	if err := writeRow(s.db, saveJobRow, j.ID, j); err != nil {
 		return Job{}, fmt.Errorf("保存任务: %w", err)
 	}
+	s.mu.Lock()
+	if index == -1 {
+		s.jobs = append(s.jobs, j)
+	} else {
+		s.jobs[index] = j
+	}
+	s.schedules[j.ID] = schedule
+	s.changes.Jobs++
+	s.mu.Unlock()
 	return j, nil
 }
 
+func (s *Service) CopyJob(id, name string) (Job, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	for _, job := range s.jobs {
+		if job.ID == id {
+			input := job.input()
+			if strings.TrimSpace(name) == "" {
+				const suffix = "（副本）"
+				name = job.Name
+				for len(name)+len(suffix) > 120 {
+					_, width := utf8.DecodeLastRuneInString(name)
+					name = name[:len(name)-width]
+				}
+				name += suffix
+			}
+			input.Name, input.Enabled = name, false
+			return s.saveJob("", input)
+		}
+	}
+	return Job{}, ErrNotFound
+}
+
 func (s *Service) Delete(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if s.closing {
 		return ErrClosing
 	}
-	if s.active[id] {
+	if _, running := s.active[id]; running {
 		return ErrBusy
 	}
-	for i, j := range s.jobs {
-		if j.ID == id {
-			next := append([]Job{}, s.jobs[:i]...)
-			next = append(next, s.jobs[i+1:]...)
-			return s.commitJobs(next)
+	for i, job := range s.jobs {
+		if job.ID != id {
+			continue
 		}
+		if _, err := s.db.Exec(`DELETE FROM jobs WHERE id=?`, id); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.jobs = append(s.jobs[:i], s.jobs[i+1:]...)
+		s.retiredSlots[job.RunSlot] = true
+		delete(s.schedules, id)
+		delete(s.lastScheduled, id)
+		s.changes.Jobs++
+		s.changes.Variables++
+		s.mu.Unlock()
+		return nil
 	}
 	return ErrNotFound
 }
 
 func (s *Service) Jobs() []JobView {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
 	views := make([]JobView, 0, len(s.jobs))
+	schedules := make([]Schedule, 0, len(s.jobs))
 	for _, j := range s.jobs {
 		uid, gid := s.jobIdentity(j)
-		v := JobView{Job: j, Running: s.active[j.ID], RunUID: uid, RunGID: gid}
-		if j.Enabled {
-			schedule := s.schedules[j.ID]
-			if next := schedule.Next(time.Now().In(s.location)); !next.IsZero() {
-				v.NextRun = &next
+		_, running := s.active[j.ID]
+		view := JobView{Job: j, Running: running, RunUID: uid, RunGID: gid}
+		if last, ok := s.lastRunByJob[j.ID]; ok {
+			view.LastRun = &last
+		}
+		views = append(views, view)
+		schedules = append(schedules, s.schedules[j.ID])
+	}
+	s.mu.RUnlock()
+	now := time.Now().In(s.location)
+	for i := range views {
+		if views[i].Enabled {
+			if next := schedules[i].Next(now); !next.IsZero() {
+				views[i].NextRun = &next
 			}
 		}
-		for i := len(s.runs) - 1; i >= 0; i-- {
-			if s.runs[i].JobID == j.ID {
-				run := s.runs[i]
-				v.LastRun = &run
-				break
-			}
-		}
-		views = append(views, v)
 	}
 	return views
-}
-
-func (s *Service) Runs(jobID string) []Run {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	runs := []Run{}
-	for i := len(s.runs) - 1; i >= 0; i-- {
-		if jobID == "" || s.runs[i].JobID == jobID {
-			runs = append(runs, s.runs[i])
-		}
-	}
-	return runs
-}
-
-func (s *Service) Log(id string) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, run := range s.runs {
-		if run.ID == id {
-			return os.ReadFile(filepath.Join(s.cfg.DataDir, "logs", id+".log"))
-		}
-	}
-	return nil, ErrNotFound
 }

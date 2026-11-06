@@ -8,6 +8,9 @@ const paths = {
   search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',
   terminal: '<path d="m5 6 6 6-6 6M13 18h6"/>',
   key: '<circle cx="8" cy="9" r="5"/><path d="m12 13 8 8m-4-4 3-3m-6 0 3-3"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="m9 3-1 3-3 1 1 3-2 2 2 2-1 3 3 1 1 3h6l1-3 3-1-1-3 2-2-2-2 1-3-3-1-1-3z"/>',
+  copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 5H6a2 2 0 0 0-2 2v10"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
   play: '<path d="m8 4 12 8-12 8z"/>',
   edit: '<path d="m15 5 4 4M4 20l5-1L20 8a2.8 2.8 0 0 0-4-4L5 15z"/>',
   trash: '<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/>',
@@ -47,8 +50,22 @@ document.querySelectorAll('.theme-button').forEach((b) => b.addEventListener('cl
 media.addEventListener('change', applyTheme);
 applyTheme();
 
-const state = { token: storage.get('lacron-token', true) || '', jobs: [], runs: [], variables: [], system: {}, filter: 'all', view: 'jobs', editing: null, editingVariable: null, deleting: null, deletingKind: 'jobs', logID: null, refreshing: false };
-const statusNames = { running: '执行中', success: '成功', failed: '失败', timeout: '已超时', interrupted: '已中断' };
+const sortFields = ['created', 'name', 'last', 'next', 'status'];
+const collator = new Intl.Collator('zh-CN', { numeric: true });
+const state = {
+  active: false, generation: 0, filter: 'all', view: 'jobs',
+  sort: sortFields.includes(storage.get('lacron-sort')) ? storage.get('lacron-sort') : 'created',
+  descending: storage.get('lacron-sort-descending') === 'true',
+  runQuery: 0, ...sessionData()
+};
+function sessionData() {
+  return {
+    jobs: [], runs: [], variables: [], system: {}, changes: {}, revisions: {},
+    runJobs: new Map(), cursors: [''], runPage: 0, nextCursor: '', refreshing: null,
+    settings: null, settingsDirty: false, passkeys: [], log: null, cleanup: null
+  };
+}
+const statusNames = { running: '执行中', success: '成功', failed: '失败', timeout: '已超时', interrupted: '已中断', cancelled: '已停止' };
 let toastTimer;
 function toast(message, error = false) {
   clearTimeout(toastTimer);
@@ -59,28 +76,52 @@ function toast(message, error = false) {
 }
 function setError(id, message) { $(id).textContent = message || ''; $(id).hidden = !message; }
 function showLogin() {
-  state.token = '';
-  storage.set('lacron-token', null, true);
+  state.active = false;
+  state.generation++;
+  Object.assign(state, sessionData());
   document.querySelectorAll('dialog[open]').forEach((d) => d.close());
+  for (const id of ['job-rows', 'run-rows', 'variable-rows', 'passkey-list', 'log-output', 'log-meta', 'variable-job-options']) $(id).replaceChildren();
+  $('run-filter').replaceChildren(new Option('全部任务', ''));
+  $('run-status-filter').value = '';
   $('workspace').hidden = true;
   $('login').hidden = false;
+  updateAuthStatus();
 }
 async function api(path, options = {}) {
-  const token = state.token;
-  const response = await fetch(`/api${path}`, { ...options, headers: { Authorization: `Bearer ${token}`, ...(options.body ? { 'Content-Type': 'application/json' } : {}) }, cache: 'no-store' });
-  if (response.status === 401) { if (state.token === token) showLogin(); throw new Error('访问令牌无效，请重新登录'); }
-  if (response.status === 204) return null;
+  const generation = state.generation;
+  const response = await fetch(`/api${path}`, {
+    ...options,
+    headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
+    cache: 'no-store', credentials: 'same-origin'
+  });
+  if (response.status === 401 && !path.startsWith('/auth/') && generation === state.generation && state.active) showLogin();
+  if (response.status === 204 || response.status === 202 && !response.headers.has('Content-Type')) return null;
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `请求失败 (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(data.error || `请求失败 (${response.status})`);
+    error.status = response.status;
+    throw error;
+  }
   return data;
+}
+function post(path, body) {
+  return api(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) });
 }
 function connection(ok) {
   $('connection').querySelector('.status-dot').classList.toggle('offline', !ok);
   $('connection-text').textContent = ok ? '已连接' : '连接中断';
 }
+const dateFormats = new Map();
 function date(value, long = false) {
   if (!value) return '—';
-  return new Intl.DateTimeFormat('zh-CN', { timeZone: state.system.timezone || 'UTC', ...(long ? { year: 'numeric' } : {}), month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(value));
+  const timeZone = state.system.timezone || 'UTC', key = `${timeZone}:${long}`;
+  if (!dateFormats.has(key)) {
+    dateFormats.set(key, new Intl.DateTimeFormat('zh-CN', {
+      timeZone, ...(long ? { year: 'numeric' } : {}), month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+    }));
+  }
+  return dateFormats.get(key).format(new Date(value));
 }
 function duration(run) {
   const seconds = Math.max(0, ((run.finished_at ? new Date(run.finished_at) : new Date()) - new Date(run.started_at)) / 1000);
@@ -88,36 +129,97 @@ function duration(run) {
 }
 function badge(status) { const el = document.createElement('span'); el.className = `badge ${statusNames[status] ? status : ''}`; el.textContent = statusNames[status] || '尚未执行'; return el; }
 function jobInput(job) { return { name: job.name, schedule: job.schedule, command: job.command, working_dir: job.working_dir, timeout_sec: job.timeout_sec, enabled: job.enabled }; }
+const views = {
+  jobs: ['任务调度', '管理调度计划和运行状态。'],
+  runs: ['执行记录', '查看执行结果、实时输出和保留记录。'],
+  variables: ['环境变量', '集中管理 Cookie 与配置，只授权给需要的任务。'],
+  settings: ['系统设置', '调整运行上限和 Passkey 登录。']
+};
 function setView(view) {
   state.view = view;
-  $('jobs-view').hidden = view !== 'jobs';
-  $('runs-view').hidden = view !== 'runs';
-  $('variables-view').hidden = view !== 'variables';
-  $('overview-metrics').hidden = view === 'variables';
+  for (const name of Object.keys(views)) $(`${name}-view`).hidden = view !== name;
+  $('overview-metrics').hidden = view !== 'jobs' && view !== 'runs';
   $('new-job').hidden = view !== 'jobs';
   $('new-variable').hidden = view !== 'variables';
-  document.querySelectorAll('[data-view]').forEach((b) => { b.classList.toggle('selected', b.dataset.view === view); b.setAttribute('aria-current', b.dataset.view === view ? 'page' : 'false'); });
-  $('page-title').textContent = { jobs: '任务调度', runs: '执行记录', variables: '环境变量' }[view];
-  $('breadcrumb-current').textContent = $('page-title').textContent;
-  $('page-description').textContent = { jobs: '把重复的工作，交给准时的每一次执行。', runs: '查看每一次运行，了解任务的每一步。', variables: '集中管理 Cookie 与配置，只授权给需要的任务。' }[view];
+  document.querySelectorAll('[data-view]').forEach((b) => {
+    b.classList.toggle('selected', b.dataset.view === view);
+    b.setAttribute('aria-current', b.dataset.view === view ? 'page' : 'false');
+  });
+  [$('page-title').textContent, $('page-description').textContent] = views[view];
+  $('breadcrumb-current').textContent = views[view][0];
 }
-document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => setView(b.dataset.view)));
+function visit(view) {
+  setView(view);
+  refresh(true).catch((error) => toast(error.message, true));
+}
+document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => visit(b.dataset.view)));
 document.querySelectorAll('[data-filter]').forEach((b) => b.addEventListener('click', () => {
   state.filter = b.dataset.filter;
   document.querySelectorAll('[data-filter]').forEach((button) => button.classList.toggle('selected', button === b));
   renderJobs();
 }));
 $('search').addEventListener('input', renderJobs);
-$('run-filter').addEventListener('change', renderRuns);
 $('variable-search').addEventListener('input', renderVariables);
+for (const id of ['run-filter', 'run-status-filter']) {
+  $(id).addEventListener('change', () => { resetRunPage(); visit('runs'); });
+}
+$('job-sort').value = state.sort;
+function renderSortDirection() {
+  $('job-sort-direction').textContent = state.descending ? '降序 ↓' : '升序 ↑';
+}
+renderSortDirection();
+$('job-sort').addEventListener('change', () => {
+  state.sort = $('job-sort').value;
+  storage.set('lacron-sort', state.sort);
+  renderJobs();
+});
+$('job-sort-direction').addEventListener('click', () => {
+  state.descending = !state.descending;
+  storage.set('lacron-sort-descending', String(state.descending));
+  renderSortDirection();
+  renderJobs();
+});
+function jobSortValue(job) {
+  switch (state.sort) {
+    case 'name': return job.name;
+    case 'last': return job.last_run?.started_at ? Date.parse(job.last_run.started_at) : null;
+    case 'next': return job.next_run ? Date.parse(job.next_run) : null;
+    case 'status': return job.running ? 0 : job.enabled ? 1 : 2;
+    default: return Date.parse(job.created_at);
+  }
+}
+function compareJobs(left, right) {
+  const a = jobSortValue(left), b = jobSortValue(right);
+  if (a === null || b === null) return Number(a === null) - Number(b === null);
+  const difference = typeof a === 'string' ? collator.compare(a, b) : a - b;
+  return state.descending ? -difference : difference;
+}
 
+// Keep unchanged rows in place so background updates preserve focus.
+function syncRows(container, items, render) {
+  const previous = new Map([...container.children].map((row) => [row.dataset.id, row]));
+  let position = container.firstElementChild;
+  for (const item of items) {
+    const version = JSON.stringify(item);
+    const old = previous.get(item.id);
+    previous.delete(item.id);
+    const row = old?.dataset.version === version ? old : render(item);
+    row.dataset.id = item.id;
+    row.dataset.version = version;
+    if (old && row !== old) old.replaceWith(row);
+    if (position === old) position = row;
+    if (row !== position) container.insertBefore(row, position);
+    position = row.nextElementSibling;
+  }
+  for (const row of previous.values()) row.remove();
+}
 function renderOverview() {
   $('metric-total').textContent = state.jobs.length;
   $('metric-enabled').textContent = state.jobs.filter((j) => j.enabled).length;
   $('metric-running').textContent = state.jobs.filter((j) => j.running).length;
-  const completed = state.runs.filter((r) => r.status !== 'running');
-  $('metric-success').textContent = completed.length ? `${Math.round(completed.filter((r) => r.status === 'success').length * 100 / completed.length)}%` : '—';
-  $('metric-runs').textContent = completed.length ? `最近 ${completed.length} 次已完成执行` : '暂无执行记录';
+  const { completed, successful } = state.changes;
+  $('metric-success').textContent = completed ? `${Math.round(successful * 100 / completed)}%` : '—';
+  $('metric-runs').textContent = completed ? `最近 ${completed} 次已完成执行` : '暂无执行记录';
   $('metric-concurrency').textContent = `并发上限 ${state.system.max_concurrent}`;
   $('nav-count').textContent = state.jobs.length;
   $('tab-total').textContent = state.jobs.length;
@@ -127,20 +229,26 @@ function renderOverview() {
   $('cron-label').textContent = state.system.cron_enabled ? (state.system.cron_running ? '秒级调度正在运行' : '调度未运行') : '定时调度已关闭';
   $('cron-dot').classList.toggle('offline', state.system.cron_enabled && !state.system.cron_running);
   $('cron-dot').classList.toggle('paused', !state.system.cron_enabled);
+  $('runs-retention').textContent = `保留最近 ${state.system.max_runs} 次`;
+  $('runs-limit').textContent = `新执行的日志最多 ${state.system.max_log_kib} KiB`;
+  $('encryption-notice').hidden = state.system.encryption_configured;
+}
+function renderRunOptions() {
   const selected = $('run-filter').value;
   const options = new Map(state.jobs.map((j) => [j.id, j.name]));
-  state.runs.forEach((r) => { if (!options.has(r.job_id)) options.set(r.job_id, `${r.job_name}（已删除）`); });
-  const all = document.createElement('option'); all.value = ''; all.textContent = '全部任务';
-  $('run-filter').replaceChildren(all);
-  options.forEach((name, id) => { const option = document.createElement('option'); option.value = id; option.textContent = name; $('run-filter').append(option); });
+  state.runJobs.forEach((name, id) => {
+    if (!options.has(id)) options.set(id, `${name}（已删除）`);
+  });
+  const all = new Option('全部任务', '');
+  $('run-filter').replaceChildren(all, ...[...options].map(([id, name]) => new Option(name, id)));
   $('run-filter').value = options.has(selected) ? selected : '';
 }
 function renderJobs() {
   const query = $('search').value.trim().toLocaleLowerCase();
   const jobs = state.jobs.filter((j) => (state.filter === 'all' || (state.filter === 'enabled' ? j.enabled : !j.enabled)) && `${j.name} ${j.command} ${j.schedule}`.toLocaleLowerCase().includes(query));
-  const fragment = document.createDocumentFragment();
-  for (const job of jobs) {
-    const row = $('job-row-template').content.cloneNode(true);
+  jobs.sort(compareJobs);
+  syncRows($('job-rows'), jobs, (job) => {
+    const row = $('job-row-template').content.firstElementChild.cloneNode(true);
     row.querySelector('.job-name').textContent = job.name;
     row.querySelector('.job-command').textContent = job.command.replace(/\s+/g, ' ');
     row.querySelector('.job-command').title = job.command;
@@ -154,22 +262,33 @@ function renderJobs() {
     toggle.title = job.enabled ? '暂停调度' : '启用调度';
     toggle.addEventListener('click', async () => {
       toggle.disabled = true;
-      try { await api(`/jobs/${job.id}`, { method: 'PUT', body: JSON.stringify({ ...jobInput(job), enabled: !job.enabled }) }); toast(job.enabled ? '已暂停调度' : '已启用调度'); await refresh(); } catch (error) { toast(error.message, true); } finally { toggle.disabled = false; }
+      try { await api(`/jobs/${job.id}`, { method: 'PUT', body: JSON.stringify({ ...jobInput(job), enabled: !job.enabled }) }); toast(job.enabled ? '已暂停调度' : '已启用调度'); await refresh(true); } catch (error) { toast(error.message, true); } finally { toggle.disabled = false; }
     });
     const run = row.querySelector('.run-job');
     run.disabled = job.running;
     run.setAttribute('aria-label', `立即执行 ${job.name}`);
-    run.addEventListener('click', async () => { run.disabled = true; try { await api(`/jobs/${job.id}/run`, { method: 'POST' }); toast('任务已开始执行'); await refresh(); } catch (error) { toast(error.message, true); } finally { run.disabled = job.running; } });
+    run.addEventListener('click', async () => { run.disabled = true; try { await api(`/jobs/${job.id}/run`, { method: 'POST' }); toast('任务已开始执行'); await refresh(true); } catch (error) { toast(error.message, true); } finally { run.disabled = job.running; } });
     row.querySelector('.edit-job').setAttribute('aria-label', `编辑 ${job.name}`);
     row.querySelector('.edit-job').addEventListener('click', () => editJob(job));
     row.querySelector('.job-history').setAttribute('aria-label', `查看 ${job.name} 的执行记录`);
-    row.querySelector('.job-history').addEventListener('click', () => { $('run-filter').value = job.id; renderRuns(); setView('runs'); });
+    row.querySelector('.job-history').addEventListener('click', () => {
+      $('run-filter').value = job.id;
+      $('run-status-filter').value = '';
+      resetRunPage();
+      visit('runs');
+    });
+    const stop = row.querySelector('.stop-job');
+    stop.hidden = !job.running || !job.last_run;
+    stop.setAttribute('aria-label', `停止 ${job.name} 的当前执行`);
+    stop.addEventListener('click', () => stopRun(job.last_run?.id, stop));
+    row.querySelector('.copy-job').setAttribute('aria-label', `复制 ${job.name}`);
+    row.querySelector('.copy-job').addEventListener('click', () => copyJob(job));
     row.querySelector('.delete-job').disabled = job.running;
     row.querySelector('.delete-job').setAttribute('aria-label', `删除 ${job.name}`);
     row.querySelector('.delete-job').addEventListener('click', () => confirmDelete('jobs', job));
-    hydrateIcons(row); fragment.append(row);
-  }
-  $('job-rows').replaceChildren(fragment);
+    hydrateIcons(row);
+    return row;
+  });
   $('jobs-table').hidden = jobs.length === 0;
   $('jobs-empty').hidden = jobs.length !== 0;
   $('jobs-empty').querySelector('h2').textContent = state.jobs.length ? '没有找到匹配的任务。' : '第一项任务，从这里开始。';
@@ -178,39 +297,135 @@ function renderJobs() {
   $('jobs-count').textContent = jobs.length === state.jobs.length ? `共 ${jobs.length} 个任务` : `显示 ${jobs.length} / ${state.jobs.length} 个任务`;
 }
 function renderRuns() {
-  const runs = state.runs.filter((r) => !$('run-filter').value || r.job_id === $('run-filter').value);
-  const fragment = document.createDocumentFragment();
-  for (const run of runs) {
-    const row = $('run-row-template').content.cloneNode(true);
+  const runs = state.runs;
+  syncRows($('run-rows'), runs, (run) => {
+    const row = $('run-row-template').content.firstElementChild.cloneNode(true);
     row.querySelector('.run-name').textContent = run.job_name;
     row.querySelector('.run-name').title = run.job_name;
     row.querySelector('.run-status').append(badge(run.status));
     row.querySelector('.run-source').textContent = run.source === 'cron' ? '定时调度' : '手动执行';
     row.querySelector('.run-start').textContent = date(run.started_at);
     row.querySelector('.run-start').title = date(run.started_at, true);
-    row.querySelector('.run-duration').textContent = duration(run);
+    row.querySelector('.open-log').textContent = run.log_cleared ? '日志已清理' : '查看日志';
     row.querySelector('.open-log').setAttribute('aria-label', `查看 ${run.job_name} 的执行日志`);
-    row.querySelector('.open-log').addEventListener('click', () => openLog(run.id));
-    hydrateIcons(row); fragment.append(row);
-  }
-  $('run-rows').replaceChildren(fragment);
+    row.querySelector('.open-log').addEventListener('click', () => openLog(run));
+    const stop = row.querySelector('.stop-run');
+    stop.hidden = run.status !== 'running';
+    stop.addEventListener('click', () => stopRun(run.id, stop));
+    const clean = row.querySelector('.clean-run');
+    clean.hidden = run.status === 'running';
+    clean.setAttribute('aria-label', `清理 ${run.job_name} 的执行记录`);
+    clean.addEventListener('click', () => openCleanup(run));
+    hydrateIcons(row);
+    return row;
+  });
+  updateRunDurations();
   $('runs-table').hidden = !runs.length;
   $('runs-empty').hidden = !!runs.length;
-  $('runs-count').textContent = `共 ${runs.length} 条执行记录`;
+  $('runs-count').textContent = runs.length ? `第 ${state.runPage + 1} 页 · ${runs.length} 条记录` : '暂无匹配的执行记录';
+  $('runs-prev').disabled = state.runPage === 0;
+  $('runs-next').disabled = !state.nextCursor;
 }
-async function refresh() {
-  const token = state.token;
-  if (!token) throw new Error('请先登录');
-  if (state.refreshing && state.refreshing.token === token) return state.refreshing.promise;
-  const promise = (async () => {
-    const [jobs, runs, system, variables] = await Promise.all([api('/jobs'), api('/runs'), api('/system'), api('/variables')]);
-    if (state.token !== token) throw new Error('登录会话已更改');
-    state.jobs = jobs; state.runs = runs; state.system = system; state.variables = variables;
-    renderOverview(); renderJobs(); renderRuns(); renderVariables(); connection(true);
-    if ($('log-dialog').open) await updateLog();
-  })();
-  state.refreshing = { token, promise };
-  try { return await promise; } catch (error) { if (state.token === token) connection(false); throw error; } finally { if (state.refreshing?.promise === promise) state.refreshing = null; }
+function updateRunDurations() {
+  const rows = $('run-rows').children;
+  state.runs.forEach((run, i) => { rows[i].querySelector('.run-duration').textContent = duration(run); });
+}
+function resetRunPage() {
+  state.runQuery++;
+  state.cursors = [''];
+  state.runPage = 0;
+  state.nextCursor = '';
+  state.runs = [];
+  renderRuns();
+}
+$('runs-prev').addEventListener('click', () => {
+  if (state.runPage === 0) return;
+  state.runPage--;
+  state.runQuery++;
+  visit('runs');
+});
+$('runs-next').addEventListener('click', () => {
+  if (!state.nextCursor) return;
+  state.cursors[++state.runPage] = state.nextCursor;
+  state.runQuery++;
+  state.nextCursor = '';
+  $('runs-next').disabled = true;
+  visit('runs');
+});
+function fetchRuns(cursor) {
+  const query = new URLSearchParams({ limit: '50' });
+  if (cursor) query.set('cursor', cursor);
+  if ($('run-filter').value) query.set('job_id', $('run-filter').value);
+  if ($('run-status-filter').value) query.set('status', $('run-status-filter').value);
+  return api(`/runs?${query}`);
+}
+function refresh(afterMutation = false) {
+  if (!state.active) return Promise.resolve();
+  const generation = state.generation;
+  if (state.refreshing) {
+    return afterMutation
+      ? state.refreshing.catch(() => {}).then(() => generation === state.generation && refresh())
+      : state.refreshing;
+  }
+  const promise = refreshData(generation).catch((error) => {
+    if (generation === state.generation) connection(false);
+    throw error;
+  }).finally(() => {
+    if (state.refreshing === promise) state.refreshing = null;
+  });
+  state.refreshing = promise;
+  return promise;
+}
+async function refreshData(generation) {
+  const changes = await api('/changes');
+  if (generation !== state.generation) return;
+  const key = (resource) => `${changes.instance}:${changes[resource]}`;
+  const changed = (resource) => state.revisions[resource] !== key(resource);
+  const jobsDue = state.jobs.some((job) => job.next_run && Date.parse(job.next_run) <= changes.now);
+  const needJobs = changed('jobs') || jobsDue;
+  const needSystem = state.revisions.system !== key('settings');
+  const needVariables = changed('variables');
+  const needSettings = state.view === 'settings' && changed('settings');
+  const query = state.runQuery, runKey = `${key('runs')}:${query}`, cursor = state.cursors[state.runPage];
+  const needRuns = state.view === 'runs' && state.revisions.runs !== runKey;
+  const [jobs, system, variables, settings, passkeys, page] = await Promise.all([
+    needJobs && api('/jobs'),
+    needSystem && api('/system'),
+    needVariables && api('/variables'),
+    needSettings && api('/settings'),
+    needSettings && api('/passkeys'),
+    needRuns && fetchRuns(cursor).catch((error) => {
+      if (error.status !== 409 || !cursor) throw error;
+      return fetchRuns('').then((fresh) => ({ ...fresh, reset: true }));
+    })
+  ]);
+  if (generation !== state.generation) return;
+  state.changes = changes;
+  if (jobs) { state.jobs = jobs; state.revisions.jobs = key('jobs'); }
+  if (system) { state.system = system; state.revisions.system = key('settings'); }
+  if (variables) { state.variables = variables; state.revisions.variables = key('variables'); }
+  if (settings) {
+    state.settings = settings;
+    state.passkeys = passkeys;
+    state.revisions.settings = key('settings');
+    renderSettings();
+  }
+  if (page && query === state.runQuery) {
+    if (page.reset) { state.cursors = ['']; state.runPage = 0; }
+    state.runs = page.items;
+    state.nextCursor = page.next_cursor || '';
+    for (const run of state.runs) state.runJobs.set(run.job_id, run.job_name);
+    state.revisions.runs = runKey;
+    renderRuns();
+  } else if (state.view === 'runs') {
+    updateRunDurations();
+  }
+  if (jobs || page) renderRunOptions();
+  if (jobs) renderJobs();
+  if (jobs || variables) renderVariables();
+  renderOverview();
+  connection(true);
+  if (state.log) updateLog().catch(() => {});
 }
 
 function editJob(job = null) {
@@ -239,20 +454,25 @@ $('job-form').addEventListener('submit', async (event) => {
   $('save-job').disabled = true;
   setError('job-error', '');
   const input = { name: $('job-name').value, schedule: $('job-schedule').value, command: $('job-command').value, working_dir: $('job-directory').value, timeout_sec: Number($('job-timeout').value), enabled: $('job-enabled').checked };
-  try { await api(state.editing ? `/jobs/${state.editing}` : '/jobs', { method: state.editing ? 'PUT' : 'POST', body: JSON.stringify(input) }); $('job-dialog').close(); toast(state.editing ? '任务已更新' : '任务已创建'); setView('jobs'); await refresh(); } catch (error) { setError('job-error', error.message); } finally { $('save-job').disabled = false; }
+  try { await api(state.editing ? `/jobs/${state.editing}` : '/jobs', { method: state.editing ? 'PUT' : 'POST', body: JSON.stringify(input) }); $('job-dialog').close(); toast(state.editing ? '任务已更新' : '任务已创建'); setView('jobs'); await refresh(true); } catch (error) { setError('job-error', error.message); } finally { $('save-job').disabled = false; }
 });
 $('confirm-delete').addEventListener('click', async () => {
   $('confirm-delete').disabled = true;
-  try { await api(`/${state.deletingKind}/${state.deleting}`, { method: 'DELETE' }); $('confirm-dialog').close(); toast(state.deletingKind === 'jobs' ? '任务已删除' : '变量已删除'); await refresh(); } catch (error) { setError('delete-error', error.message); } finally { $('confirm-delete').disabled = false; }
+  try { await api(`/${state.deletingKind}/${state.deleting}`, { method: 'DELETE' }); $('confirm-dialog').close(); toast({ jobs: '任务已删除', variables: '变量已删除', passkeys: 'Passkey 已移除' }[state.deletingKind]); await refresh(true); } catch (error) { setError('delete-error', error.message); } finally { $('confirm-delete').disabled = false; }
 });
 
 function confirmDelete(kind, item) {
   state.deletingKind = kind; state.deleting = item.id;
-  const variable = kind === 'variables';
-  $('confirm-title').textContent = variable ? '删除这个变量？' : '删除这个任务？';
-  $('confirm-delete').textContent = variable ? '删除变量' : '删除任务';
-  $('confirm-description').textContent = `将删除「${item.name}」。此操作无法撤销。`;
-  $('confirm-note').textContent = variable ? '后续运行不再注入此变量，已经运行的进程保持原有环境。' : '删除后将停止调度，已有执行记录会继续保留。';
+  const labels = { jobs: '任务', variables: '变量', passkeys: 'Passkey' };
+  const action = kind === 'passkeys' ? '移除' : '删除';
+  $('confirm-title').textContent = `${action}这个${labels[kind]}？`;
+  $('confirm-delete').textContent = `${action}${labels[kind]}`;
+  $('confirm-description').textContent = `将${action}「${item.name}」。此操作无法撤销。`;
+  $('confirm-note').textContent = {
+    variables: '后续运行会应用变更，已在运行的进程会保留原有环境。',
+    jobs: '删除后将停止调度，已有执行记录会继续保留。',
+    passkeys: '将撤销这个凭据的登录会话。可使用管理令牌重新登录。'
+  }[kind];
   setError('delete-error', ''); $('confirm-dialog').showModal();
 }
 
@@ -313,42 +533,372 @@ $('variable-form').addEventListener('submit', async (event) => {
   if (!state.editingVariable || $('variable-value').value !== '') input.value = $('variable-value').value;
   try {
     await api(state.editingVariable ? `/variables/${state.editingVariable}` : '/variables', { method: state.editingVariable ? 'PUT' : 'POST', body: JSON.stringify(input) });
-    $('variable-dialog').close(); toast('变量与授权已保存'); await refresh();
+    $('variable-dialog').close(); toast('变量与授权已保存'); await refresh(true);
   } catch (error) { setError('variable-error', error.message); } finally { $('save-variable').disabled = false; }
 });
-async function openLog(id) {
-  state.logID = id;
+function copyJob(job) {
+  state.copyID = job.id;
+  let name = job.name;
+  const encoder = new TextEncoder(), suffix = '（副本）';
+  while (encoder.encode(name + suffix).length > 120) name = [...name].slice(0, -1).join('');
+  $('copy-name').value = name + suffix;
+  setError('copy-error', '');
+  $('copy-dialog').showModal();
+}
+$('copy-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  $('copy-submit').disabled = true;
+  setError('copy-error', '');
+  try {
+    await post(`/jobs/${state.copyID}/copy`, { name: $('copy-name').value });
+    $('copy-dialog').close();
+    toast('已复制任务');
+    await refresh(true);
+  } catch (error) { setError('copy-error', error.message); }
+  finally { $('copy-submit').disabled = false; }
+});
+async function stopRun(id, button) {
+  if (!id) return;
+  button.disabled = true;
+  try {
+    await post(`/runs/${id}/stop`);
+    toast('已请求停止本次执行');
+    await refresh(true);
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+}
+
+function openCleanup(run = null) {
+  state.cleanup = { run, approved: null };
+  $('cleanup-form').reset();
+  $('cleanup-single').textContent = run ? `${run.job_name} · ${date(run.started_at, true)}` : '';
+  $('cleanup-single').hidden = !run;
+  $('cleanup-scope').hidden = !!run;
+  $('cleanup-job').replaceChildren(...[...$('run-filter').options].map((option) => option.cloneNode(true)));
+  $('cleanup-job').value = $('run-filter').value;
+  invalidateCleanup();
+  $('cleanup-dialog').showModal();
+}
+function invalidateCleanup() {
+  state.cleanup.approved = null;
+  $('apply-cleanup').disabled = true;
+  $('cleanup-preview').textContent = '';
+  setError('cleanup-error', '');
+}
+$('clean-logs').addEventListener('click', () => openCleanup());
+$('cleanup-form').addEventListener('input', invalidateCleanup);
+function cleanupInput() {
+  const input = { mode: $('cleanup-mode').value };
+  if (state.cleanup.run) {
+    input.run_id = state.cleanup.run.id;
+  } else {
+    if ($('cleanup-job').value) input.job_id = $('cleanup-job').value;
+    if ($('cleanup-before').value) input.before = new Date($('cleanup-before').value + 'T00:00:00').toISOString();
+    if (!input.job_id && !input.before) input.all = true;
+  }
+  return input;
+}
+$('cleanup-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  invalidateCleanup();
+  const cleanup = state.cleanup, input = cleanupInput(), key = JSON.stringify(input);
+  $('preview-cleanup').disabled = true;
+  try {
+    const result = await post('/runs/cleanup/preview', input);
+    if (cleanup !== state.cleanup || !$('cleanup-dialog').open || key !== JSON.stringify(cleanupInput())) return;
+    cleanup.approved = { ...input, cutoff: result.cutoff };
+    $('cleanup-preview').textContent = `将清理 ${result.matched} 条，跳过 ${result.skipped} 条。`;
+    $('apply-cleanup').disabled = !result.matched;
+  } catch (error) { setError('cleanup-error', error.message); }
+  finally { $('preview-cleanup').disabled = false; }
+});
+$('apply-cleanup').addEventListener('click', async () => {
+  const input = state.cleanup.approved;
+  if (!input) return;
+  $('apply-cleanup').disabled = true;
+  try {
+    const result = await post('/runs/cleanup', input);
+    $('cleanup-dialog').close();
+    toast(`已清理 ${result.matched} 条${result.pending ? `，${result.pending} 个文件将在重启时重试删除` : ''}`);
+    await refresh(true);
+  } catch (error) {
+    setError('cleanup-error', error.message);
+    $('apply-cleanup').disabled = !state.cleanup?.approved;
+  }
+});
+
+function openLog(run) {
+  state.log = { run, offset: 0, loaded: false, more: true, pending: false };
   $('log-output').textContent = '正在读取日志…';
   $('log-truncated').hidden = true;
+  renderLogMeta(run);
   $('log-dialog').showModal();
-  try { await updateLog(); } catch (error) { $('log-output').textContent = error.message; }
+  updateLog().catch(() => {});
+}
+function renderLogMeta(run) {
+  $('log-title').textContent = run.job_name;
+  const meta = $('log-meta');
+  meta.replaceChildren(badge(run.status));
+  const values = [date(run.started_at, true), duration(run), run.source === 'cron' ? '定时调度' : '手动执行'];
+  if (run.exit_code != null) values.splice(2, 0, `退出码 ${run.exit_code}`);
+  for (const text of values) {
+    const span = document.createElement('span');
+    span.textContent = text;
+    meta.append(span);
+  }
+  $('log-truncated').hidden = !run.truncated;
+  $('log-stop').hidden = run.status !== 'running';
+  $('log-clean').hidden = run.status === 'running';
+  $('log-refresh-status').textContent = run.status === 'running' ? '每 5 秒读取新输出' : '';
 }
 async function updateLog() {
-  const id = state.logID;
-  const run = state.runs.find((r) => r.id === id);
-  if (!run) { $('log-output').textContent = '该记录已超过保留上限。'; return; }
-  $('log-title').textContent = run.job_name;
-  const meta = $('log-meta'); meta.replaceChildren(badge(run.status));
-  for (const text of [date(run.started_at, true), duration(run), run.exit_code == null ? '执行中' : `退出码 ${run.exit_code}`, run.source === 'cron' ? '定时调度' : '手动执行']) { const span = document.createElement('span'); span.textContent = text; meta.append(span); }
-  $('log-truncated').hidden = !run.truncated;
-  const data = await api(`/runs/${id}/log`);
-  if (state.logID !== id) return;
-  const output = $('log-output');
-  const atBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 50;
-  output.textContent = data.output || (run.status === 'running' ? '正在执行，等待输出…' : '本次执行没有输出。');
-  if (atBottom) output.scrollTop = output.scrollHeight;
+  const log = state.log;
+  if (!log || log.pending || log.missing) return;
+  const revision = `${state.changes.instance}:${state.changes.runs}`;
+  if (log.loaded && !log.more && log.run.status !== 'running' && log.revision === revision) return;
+  log.pending = true;
+  try {
+    do {
+      const chunk = await api(`/runs/${log.run.id}/log?offset=${log.offset}&limit=131072`);
+      if (state.log !== log) return;
+      const output = $('log-output');
+      const atBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 50;
+      if (!log.offset || chunk.reset) output.replaceChildren();
+      if (chunk.output) output.append(document.createTextNode(chunk.output));
+      if (!chunk.next_offset && !chunk.output) {
+        output.textContent = chunk.run.log_cleared ? '本次日志已清理。' :
+          chunk.run.status === 'running' ? '正在执行，等待输出…' : '本次执行没有输出。';
+      }
+      if (atBottom) output.scrollTop = output.scrollHeight;
+      log.more = chunk.more && chunk.next_offset !== log.offset;
+      log.offset = chunk.next_offset;
+      log.run = chunk.run;
+      log.loaded = true;
+      log.revision = revision;
+      renderLogMeta(log.run);
+    } while (log.more);
+  } catch (error) {
+    if (state.log !== log) return;
+    if (error.status === 404) {
+      log.missing = true;
+      $('log-output').textContent = '这条执行记录已删除或超过保留上限。';
+      $('log-stop').hidden = $('log-clean').hidden = $('log-truncated').hidden = true;
+      $('log-refresh-status').textContent = '';
+    } else {
+      $('log-refresh-status').textContent = error.message;
+    }
+  } finally {
+    log.pending = false;
+  }
 }
-$('logout').addEventListener('click', () => { showLogin(); $('token').value = ''; });
+$('log-stop').addEventListener('click', () => stopRun(state.log?.run.id, $('log-stop')));
+$('log-clean').addEventListener('click', () => { if (state.log) openCleanup(state.log.run); });
+$('log-dialog').addEventListener('close', () => { if (!$('log-dialog').open) state.log = null; });
+
+function canUsePasskeys() {
+  return window.isSecureContext && !!window.PublicKeyCredential && !!navigator.credentials;
+}
+function renderSettings() {
+  const settings = state.settings;
+  $('save-settings').disabled = false;
+  if (!state.settingsDirty) {
+    $('settings-concurrent').value = settings.max_concurrent;
+    $('settings-runs').value = settings.max_runs;
+    $('settings-log').value = settings.max_log_kib;
+    $('settings-passkey-enabled').checked = settings.passkey_enabled;
+    $('settings-origin').value = settings.passkey_origin;
+  }
+  const ready = settings.passkey_enabled && settings.passkey_origin === location.origin && canUsePasskeys();
+  $('add-passkey').disabled = !ready;
+  $('passkey-hint').textContent = !settings.passkey_enabled ? '请先启用 Passkey 并保存设置。' :
+    ready ? '可为多个设备分别绑定。' : '请从已配置的站点地址用支持 Passkey 的浏览器打开。';
+  const list = $('passkey-list');
+  syncRows(list, state.passkeys, (key) => {
+    const item = document.createElement('li');
+    const details = document.createElement('div');
+    const title = document.createElement('strong');
+    title.textContent = key.name;
+    const caption = document.createElement('p');
+    caption.className = 'small muted';
+    caption.textContent = `绑定于 ${date(key.created_at, true)}${key.last_used_at ? ` · 最近使用 ${date(key.last_used_at, true)}` : ''}`;
+    details.append(title, caption);
+    const remove = document.createElement('button');
+    remove.className = 'text-button warning-action';
+    remove.type = 'button';
+    remove.textContent = '移除';
+    remove.setAttribute('aria-label', `移除 Passkey ${key.name}`);
+    remove.addEventListener('click', () => confirmDelete('passkeys', key));
+    item.append(details, remove);
+    return item;
+  });
+  $('passkey-hint').textContent += state.passkeys.length ? '' : ' 尚未绑定设备。';
+}
+$('settings-form').addEventListener('input', () => { state.settingsDirty = true; });
+$('settings-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const input = {
+    max_concurrent: Number($('settings-concurrent').value),
+    max_runs: Number($('settings-runs').value),
+    max_log_kib: Number($('settings-log').value),
+    passkey_enabled: $('settings-passkey-enabled').checked,
+    passkey_origin: $('settings-origin').value.trim()
+  };
+  if (state.settings && input.max_runs < state.settings.max_runs && !window.confirm('降低记录上限可能立即清理最早的执行记录和日志。保存设置？')) return;
+  $('save-settings').disabled = true;
+  setError('settings-error', '');
+  try {
+    state.settings = await api('/settings', { method: 'PUT', body: JSON.stringify(input) });
+    state.settingsDirty = false;
+    renderSettings();
+    toast('系统设置已保存');
+    await refresh(true);
+  } catch (error) { setError('settings-error', error.message); }
+  finally { $('save-settings').disabled = false; }
+});
+
+function decodeWebAuthn(value) {
+  return Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/')), (byte) => byte.charCodeAt(0));
+}
+function encodeWebAuthn(value) {
+  if (!value) return null;
+  const bytes = new Uint8Array(value);
+  let result = '';
+  for (const byte of bytes) result += String.fromCharCode(byte);
+  return btoa(result).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function credentialOptions(options, register) {
+  const key = options.publicKey;
+  if (register && PublicKeyCredential.parseCreationOptionsFromJSON) {
+    return PublicKeyCredential.parseCreationOptionsFromJSON(key);
+  }
+  if (!register && PublicKeyCredential.parseRequestOptionsFromJSON) {
+    return PublicKeyCredential.parseRequestOptionsFromJSON(key);
+  }
+  key.challenge = decodeWebAuthn(key.challenge);
+  if (key.user) key.user.id = decodeWebAuthn(key.user.id);
+  for (const list of [key.excludeCredentials, key.allowCredentials]) {
+    for (const credential of list || []) credential.id = decodeWebAuthn(credential.id);
+  }
+  return key;
+}
+function credentialJSON(credential, register) {
+  if (credential.toJSON) return credential.toJSON();
+  const response = credential.response;
+  return {
+    id: credential.id,
+    rawId: encodeWebAuthn(credential.rawId),
+    type: credential.type,
+    authenticatorAttachment: credential.authenticatorAttachment,
+    clientExtensionResults: credential.getClientExtensionResults(),
+    response: {
+      clientDataJSON: encodeWebAuthn(response.clientDataJSON),
+      ...(register ? { attestationObject: encodeWebAuthn(response.attestationObject), transports: response.getTransports?.() } :
+        { authenticatorData: encodeWebAuthn(response.authenticatorData), signature: encodeWebAuthn(response.signature), userHandle: encodeWebAuthn(response.userHandle) })
+    }
+  };
+}
+async function usePasskey(register, body, signal) {
+  const path = register ? '/passkeys' : '/auth/passkey';
+  const challenge = await post(`${path}/begin`, body);
+  const publicKey = credentialOptions(challenge.options, register);
+  const credential = await (register ? navigator.credentials.create({ publicKey, signal }) : navigator.credentials.get({ publicKey, signal }));
+  if (!credential) throw new Error('设备未返回 Passkey');
+  return post(`${path}/finish`, { challenge_id: challenge.challenge_id, credential: credentialJSON(credential, register) });
+}
+function passkeyError(error) {
+  return error.name === 'NotAllowedError' || error.name === 'AbortError' ? '设备验证已取消或超时，请重试。' : error.message;
+}
+$('add-passkey').addEventListener('click', () => {
+  $('passkey-form').reset();
+  setError('passkey-error', '');
+  $('passkey-dialog').showModal();
+});
+let registration;
+$('passkey-dialog').addEventListener('close', () => { if (!$('passkey-dialog').open) registration?.abort(); });
+$('passkey-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  $('passkey-submit').disabled = true;
+  setError('passkey-error', '');
+  registration = new AbortController();
+  try {
+    await usePasskey(true, { name: $('passkey-name').value }, registration.signal);
+    $('passkey-dialog').close();
+    toast('Passkey 已绑定');
+    await refresh(true);
+  } catch (error) {
+    if ($('passkey-dialog').open) setError('passkey-error', passkeyError(error));
+  } finally {
+    registration = null;
+    $('passkey-submit').disabled = false;
+  }
+});
+async function updateAuthStatus() {
+  const generation = state.generation;
+  $('passkey-login').hidden = true;
+  try {
+    const data = await api('/auth/status');
+    if (generation === state.generation && !state.active) {
+      $('passkey-login').hidden = !data.passkey_ready || data.passkey_origin !== location.origin || !canUsePasskeys();
+    }
+  } catch { /* Token login remains available. */ }
+}
+async function connect() {
+  state.active = true;
+  setView('jobs');
+  $('token').value = '';
+  await refresh();
+  if (state.active) {
+    $('login').hidden = true;
+    $('workspace').hidden = false;
+  }
+}
+function tokenLogin(token) {
+  return api('/auth/token', { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+}
+const loginSubmit = $('login-form').querySelector('button[type="submit"]');
+function loginBusy(busy) { loginSubmit.disabled = $('passkey-login').disabled = busy; }
+$('logout').addEventListener('click', async () => {
+  $('logout').disabled = true;
+  try {
+    await post('/auth/logout');
+    $('token').value = '';
+    showLogin();
+  } catch (error) { toast(error.message, true); }
+  finally { $('logout').disabled = false; }
+});
 $('login-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const button = $('login-form').querySelector('button[type="submit"]'); button.disabled = true;
-  state.token = $('token').value.trim();
+  loginBusy(true);
   setError('login-error', '');
-  try { await refresh(); storage.set('lacron-token', state.token, true); $('token').value = ''; $('login').hidden = true; $('workspace').hidden = false; } catch (error) { setError('login-error', error.message); } finally { button.disabled = false; }
+  try {
+    await tokenLogin($('token').value.trim());
+    await connect();
+  } catch (error) { setError('login-error', error.message); }
+  finally { loginBusy(false); }
 });
-setInterval(() => { if (state.token && !document.hidden) refresh().catch(() => {}); }, 5000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden && state.token) refresh().catch(() => {}); });
-if (state.token) {
-  const token = state.token;
-  refresh().then(() => { if (state.token === token) { $('login').hidden = true; $('workspace').hidden = false; } }).catch((error) => { if (state.token === token || !state.token) { showLogin(); setError('login-error', error.message); } });
+$('passkey-login').addEventListener('click', async () => {
+  loginBusy(true);
+  setError('login-error', '');
+  try {
+    await usePasskey(false);
+    await connect();
+  } catch (error) { setError('login-error', passkeyError(error)); }
+  finally { loginBusy(false); }
+});
+function poll() {
+  if (state.active && !document.hidden) refresh().catch(() => {});
 }
+setInterval(poll, 5000);
+document.addEventListener('visibilitychange', poll);
+(async function restoreSession() {
+  loginBusy(true);
+  const previous = storage.get('lacron-token', true);
+  storage.set('lacron-token', null, true);
+  try {
+    if (previous) await tokenLogin(previous).catch(() => {});
+    await connect();
+  } catch (error) {
+    if (state.active) showLogin();
+    if (error.status !== 401) setError('login-error', error.message);
+  } finally { loginBusy(false); }
+})();

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Actual container isolation: grants, distinct UIDs, /proc, persistence and revoke."""
+import base64
 import json
 import re
 import secrets
@@ -16,10 +17,11 @@ def main():
     name = "lacron-env-" + uuid.uuid4().hex[:10]
     volume = name + "-data"
     token, secret_a, secret_b = (secrets.token_urlsafe(32) for _ in range(3))
+    key = base64.b64encode(secrets.token_bytes(32)).decode()
     docker("volume", "create", volume)
     try:
         docker("run", "-d", "--name", name, "-p", "127.0.0.1::8080", "-v", volume + ":/data",
-               "-e", "LACRON_TOKEN=" + token, "--read-only", "--tmpfs", "/run", "--tmpfs", "/tmp:mode=1777",
+               "-e", "LACRON_TOKEN=" + token, "-e", "LACRON_ENCRYPTION_KEY=" + key, "--read-only", "--tmpfs", "/run", "--tmpfs", "/tmp:mode=1777",
                "--cap-drop=ALL", "--cap-add=SETUID", "--cap-add=SETGID", "--cap-add=KILL", image)
         base = "http://127.0.0.1:" + docker("port", name, "8080/tcp").stdout.strip().rsplit(":", 1)[1]
 
@@ -56,7 +58,7 @@ def main():
         assert identities[a["id"]] != identities[b["id"]]
         variable_a = api("/api/variables", "POST", {"name": "CHECKIN_COOKIE", "value": secret_a, "job_ids": [a["id"]]}, status=201)
         assert variable_a["has_value"] and "value" not in variable_a
-        stat = docker("exec", name, "stat", "-c", "%a", "/data/variables.json").stdout.strip()
+        stat = docker("exec", name, "stat", "-c", "%a", "/data/lacron.sqlite3").stdout.strip()
         assert stat == "600", stat
 
         run_a = api("/api/jobs/" + a["id"] + "/run", "POST", status=202)
@@ -70,7 +72,8 @@ def main():
         pid = eventually(owner_pid, timeout=5)
         probe = f'''const fs=require("node:fs"),assert=require("node:assert/strict");
 assert.equal(process.env.CHECKIN_COOKIE,undefined);
-for(const path of ["/proc/{pid}/environ","/data/variables.json",{json.dumps(private_file)}]){{
+assert.equal(process.env.LACRON_ENCRYPTION_KEY,undefined);
+for(const path of ["/proc/{pid}/environ","/data/lacron.sqlite3",{json.dumps(private_file)}]){{
   let denied=false;try{{fs.readFileSync(path);}}catch(e){{denied=["EACCES","EPERM"].includes(e.code);}}
   assert(denied,"cross-task secret source readable: "+path);
 }}

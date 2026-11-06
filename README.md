@@ -5,14 +5,14 @@
 ## 功能
 
 - 简洁扁平化中文界面，支持浅色、深色和跟随系统，适配手机。
-- 创建、编辑、删除、启用和暂停 cron 任务，支持常用时间预设、搜索和下次执行时间。
+- 创建、编辑、复制、删除、启用和暂停任务，支持时间预设、搜索和自定义排序。
 - 六字段秒级调度，兼容原有五字段分钟级任务，界面时间显示到秒。
 - 执行 Shell / JavaScript 命令；暂停的任务也可手动运行。
-- 显示运行状态、触发来源、耗时、退出码和输出日志，每 5 秒刷新。
-- 同一任务防重入，可配置总并发数；超时和容器关闭会终止任务进程组。
-- 原子写入 JSON，重启恢复任务和执行记录；无需数据库或外部前端服务。
-- 环境变量管理页面：值保存后不回显，按任务勾选授权；支持不同账号使用同名、不同值的变量。
-- 访问令牌鉴权，拒绝跨站写请求；任务使用各自的非 root UID/GID，不继承管理令牌等服务环境变量。
+- 执行记录按任务和状态分页筛选，运行中每 5 秒读取新增输出，支持停止执行和预览后清理日志。
+- 系统设置支持在线修改总并发数、执行记录保留上限、单次日志大小和 Passkey 登录。
+- 使用内置 SQLite 持久化任务、执行记录、变量和设置，按记录更新。任务各自使用非 root UID/GID。
+- 变量值使用 AES-256-GCM 加密保存，仅向已授权任务注入。不同账号可使用同名变量。
+- WebUI 支持管理令牌和 Passkey 登录，管理 API 支持 Bearer 令牌。
 - 内置 `fetch` 多步骤 Cookie 签到示例：查状态、获取参数、提交签到、再次确认结果。
 - MIT 开源协议。
 
@@ -43,9 +43,22 @@ Cron：*/5 * * * * *
 
 Compose 默认时区为 `Asia/Shanghai`，仅绑定宿主机 `127.0.0.1:8080`。远程访问可使用 SSH 端口转发或配置 HTTPS 反向代理。代理应保留 `Host` 和 `Authorization` 请求头。管理令牌有执行容器内命令的权限，请只交给可信管理员。
 
-可复制 `.env.example` 为 `.env` 调整端口、时区、并发数，或设置自己的随机令牌（至少 24 字节、无空白）。令牌只在浏览器当前标签页会话内保存，退出登录即清除。自定义令牌应使用随机生成器生成，不要提交到 Git。
+可复制 `.env.example` 为 `.env` 调整端口、时区、初始并发数和令牌。自定义令牌至少 24 字节且无空白。WebUI 登录后使用 12 小时有效的 HttpOnly 会话 Cookie。退出登录或重启服务会使会话失效。
+
+## 系统设置与 Passkey
+
+在「系统设置」可调整并发上限（1–32）、执行记录上限（1–2000）和单次日志上限（1–4096 KiB）。降低并发上限会限制后续执行的准入，当前任务可继续运行。降低记录上限会清理最早的已结束记录和对应日志。单次日志上限应用于设置保存后开始的执行。
+
+1. 使用管理令牌登录。
+2. 在「系统设置」启用 Passkey，填写浏览器使用的站点地址并保存。远程访问使用 HTTPS 域名，本机可以使用 `http://localhost:8080`。反向代理需保留浏览器请求的 `Host`。
+3. 从该地址打开页面，点击「绑定 Passkey」并完成设备验证。之后可在登录页使用 Passkey，也可用管理令牌登录。
+4. 可绑定多个凭据。移除凭据会撤销用它建立的会话。更换站点域名前，先移除该域名的凭据。
+
+任务列表可按创建顺序、名称、最近执行、下次执行和状态升降序排列，排序偏好保存在当前浏览器。复制的任务默认暂停，并分配独立运行身份。如需让副本读取环境变量，可在变量页面重新授权。点击「停止执行」会终止本次运行的进程组，任务后续仍按计划调度。
 
 ## 环境变量与按任务授权
+
+添加变量前，先用 `openssl rand -base64 32` 生成一次密钥，并将输出设为容器的 `LACRON_ENCRYPTION_KEY`。Compose 可在 `.env` 中设置，Podman 可使用 `-e LACRON_ENCRYPTION_KEY` 传入同名宿主机环境变量。重建容器时使用原密钥和数据卷。
 
 侧栏和手机导航中的「环境变量」页面可新建、编辑、删除变量，并勾选允许读取它的任务。新变量默认不授权任何任务。执行时，Go 在启动进程前取一份已授权变量快照，追加到该任务独立的 `cmd.Env`；不会修改服务全局环境，也不会自动继承容器的任意环境变量。
 
@@ -54,7 +67,7 @@ Compose 默认时区为 `Asia/Shanghai`，仅绑定宿主机 `127.0.0.1:8080`。
 3. 添加脚本需要的其他配置变量，并分别授权。脚本通过 `process.env.CHECKIN_COOKIE` 读取；sh 则使用 `"$CHECKIN_COOKIE"`。
 4. 编辑变量时，值留空表示保留原值，可以只修改描述或授权。API 更新省略 `value` 也会保留；显式传 `"value":""` 才会设置空值。
 
-变量列表、创建和编辑响应都不返回值，页面不将值存入浏览器存储。变量以明文保存在 `/data/variables.json`，文件权限 `0600`，父目录 `0700`，随 `/data` 数据卷持久化。备份包含这些凭据，请保留原文件权限。
+SQLite 只保存变量的加密值和授权元数据，API 只返回元数据。请单独保管密钥，恢复数据卷时需要同一密钥。轮换时设置新的 `LACRON_ENCRYPTION_KEY`，同时用 `LACRON_PREVIOUS_ENCRYPTION_KEY` 提供旧密钥。成功启动并完成轮换后，可在下一次重建时移除旧密钥。
 
 **多账号无需复制脚本**：可分别创建两个名为 `CHECKIN_COOKIE` 的变量，描述为「账号 A」和「账号 B」，只给各自任务授权。一个任务最多获授权一个同名变量；同时勾选造成冲突时，保存会被拒绝。站点地址等非敏感配置则可用一条变量授权给多个任务。
 
@@ -147,7 +160,7 @@ GHCR 首次发布的包默认是私有的。若需匿名拉取，请由仓库所
 podman login ghcr.io -u dismay712
 ```
 
-拉取和启动镜像（默认权限、可写根文件系统）：
+拉取和启动镜像。需要使用变量时，先设置宿主机的 `LACRON_ENCRYPTION_KEY`，由 `-e` 传入。
 
 ```sh
 podman pull ghcr.io/dismay712/lacron:latest
@@ -156,6 +169,7 @@ podman run -d --name lacron \
   --restart=unless-stopped \
   -p 127.0.0.1:8080:8080 \
   -e TZ=Asia/Shanghai \
+  -e LACRON_ENCRYPTION_KEY \
   -v lacron-data:/data \
   ghcr.io/dismay712/lacron:latest
 podman exec lacron cat /data/admin.token
@@ -256,12 +270,14 @@ COPY my-task.js ./
 
 ## 持久化与运行权限
 
-- `/data/jobs.json`：任务配置。
-- `/data/variables.json`：变量值及任务授权，明文、权限 `0600`，仅管理服务可读。
-- `/data/crontabs/root`：仅旧版本遗留；升级启动时清空旧管理条目，避免重复调度，新安装无需该文件。
-- `/data/runs.json`、`/data/logs/`：全局最近 200 次执行及日志，每次输出上限 256 KiB；超过上限继续消费输出并丢弃，防止日志填满磁盘。被淘汰记录的日志一并删除。
-- `/data/admin.token`：自动生成的管理令牌，只有 root 可读。
-- `/run/lacron/runner.sock`：兼容本地 `lacron trigger` 的 Unix socket，不对外暴露；秒级调度直接调用执行器。
+- `/data/lacron.sqlite3` 保存任务、执行记录、加密变量、Passkey 凭据和系统设置。使用 WAL，每次执行只写新增或变更的记录。
+- `/data/logs/` 保存每次执行的输出，默认保留 200 条记录，每次最多 256 KiB。淘汰执行记录时一并删除其日志。
+- `/data/admin.token` 保存自动生成的管理令牌。
+- `/run/lacron/runner.sock` 提供兼容的本地 `lacron trigger` 接口。
+
+「执行记录」可按单次执行、任务或日期预览清理范围。可以清除输出并保留状态和耗时，也可以删除整条记录。清理跳过正在执行的任务。
+
+从旧版升级时，保留原数据卷。服务首次启动会导入原有 `jobs.json`、`runs.json`、`variables.json` 和任务授权，现有日志继续使用。已有变量的实例必须先设置加密密钥。加密导入完成后会删除旧的明文 `variables.json`，原任务和执行 JSON 保留为升级前快照。旧 crontab 会在升级时清理。若要回退旧版，请使用升级前的数据卷备份。
 
 通过命名卷 `lacron-data` 持久化，`docker compose down` 不删除数据；`down -v` 会删除数据。备份前停止容器，完整备份数据卷；恢复时保留文件权限。通过 WebUI/API 管理任务。单个数据目录只允许一个服务实例，使用文件锁防止多实例并发写入。
 
@@ -281,7 +297,9 @@ COPY my-task.js ./
 | `LACRON_SOCKET` | `/run/lacron/runner.sock` | 内部 Unix socket，绝对路径 |
 | `LACRON_TOKEN` | 自动生成 | 至少 24 字节的访问令牌 |
 | `LACRON_TOKEN_FILE` | 空 | 从 Docker secret 等文件读取令牌；与 `LACRON_TOKEN` 互斥 |
-| `LACRON_MAX_CONCURRENT` | `4` | 全局并发数，1–32 |
+| `LACRON_MAX_CONCURRENT` | `4` | 初始并发数，1–32。系统设置保存后以数据库中的值为准 |
+| `LACRON_ENCRYPTION_KEY` | 空 | Base64 编码的 32 字节密钥。添加变量或迁移已有变量时必填 |
+| `LACRON_PREVIOUS_ENCRYPTION_KEY` | 空 | 轮换加密密钥时临时提供的旧密钥 |
 | `LACRON_APK_PACKAGES` | 空 | 启动时安装的 Alpine 软件包，以空白分隔；需 root 和可写根文件系统 |
 | `LACRON_RUN_UID` / `LACRON_RUN_GID` | `10001` / `10001` | 隔离任务 UID/GID 范围的起始值，需容纳连续 500 个身份 |
 | `LACRON_SCRIPT_PATH` | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` | 用户命令的 PATH |
@@ -291,7 +309,7 @@ COPY my-task.js ./
 
 ## API
 
-所有 `/api/*` 请求需要 `Authorization: Bearer <token>`，`GET /healthz` 无需鉴权。`/healthz` 同时检查秒级调度器状态；`/api/system` 返回 `scheduler: "go"`、`schedule_precision: "second"` 和兼容的 `cron_enabled` / `cron_running` 字段。
+管理 API 可用 `Authorization: Bearer <token>`，WebUI 使用同站会话 Cookie。`GET /healthz` 和浏览器登录入口允许未登录访问。`/healthz` 检查调度器状态，`/api/system` 返回 `scheduler: "go"`、`schedule_precision: "second"`、原有的 `cron_enabled` / `cron_running` 及当前运行上限。
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
@@ -299,8 +317,16 @@ COPY my-task.js ./
 | GET / POST | `/api/jobs` | 查询 / 新建任务 |
 | PUT / DELETE | `/api/jobs/{id}` | 更新 / 删除任务 |
 | POST | `/api/jobs/{id}/run` | 手动执行，返回 202 和执行 ID |
-| GET | `/api/runs?job_id={id}` | 最近执行，可选按任务过滤 |
-| GET | `/api/runs/{id}/log` | 输出日志：`{"output":"..."}` |
+| POST | `/api/jobs/{id}/copy` | 创建暂停的副本，支持可选的 `name` |
+| POST | `/api/runs/{id}/stop` | 停止指定执行，返回 202 |
+| GET | `/api/runs?job_id={id}` | 最近执行，兼容原有数组格式 |
+| GET | `/api/runs?limit=50&cursor=…&status=…` | 分页和状态过滤，返回 `items` 和下一页游标 |
+| GET | `/api/runs/{id}/log` | 完整日志，返回 `output` |
+| GET | `/api/runs/{id}/log?offset=0&limit=65536` | 分块日志，返回运行状态、输出、`next_offset`、`more` 和 `reset` |
+| POST | `/api/runs/cleanup/preview` 和 `/api/runs/cleanup` | 预览和确认清理，提交预览返回的 `cutoff` |
+| GET | `/api/changes` | 查询各数据区的修订号和执行统计 |
+| GET / PUT | `/api/settings` | 查看和保存系统设置 |
+| GET / DELETE | `/api/passkeys`、`/api/passkeys/{id}` | 查看已绑定设备和移除凭据 |
 | GET / POST | `/api/variables` | 查询元数据 / 新建变量；不回显值 |
 | PUT / DELETE | `/api/variables/{id}` | 修改值/描述/任务授权，或删除变量 |
 
@@ -317,13 +343,13 @@ COPY my-task.js ./
 }
 ```
 
-返回状态包含 `running`、`success`、`failed`、`timeout`、`interrupted`。日志以纯文本显示，不执行输出中的 HTML。
+返回状态包含 `running`、`success`、`failed`、`timeout`、`cancelled`、`interrupted`。日志以纯文本显示，不执行输出中的 HTML。
 
 创建变量使用 `{"name":"CHECKIN_COOKIE","value":"用户Cookie","description":"账号 A","job_ids":["任务ID"]}`。更新时省略 `value` 保留原值；省略 `job_ids` 表示撤销全部授权。变量 API 的响应只包含 `id`、`name`、`description`、`job_ids`、`has_value` 和时间戳。创建/更新变量需要服务运行于容器内 root，普通非 root 开发模式返回 403。
 
 ## 开发和验证
 
-Go 1.24+，仅使用标准库，无第三方 Go 模块。目标系统为 Linux。
+目标系统为 Linux，构建需要 Go 1.26 或更新版本。SQLite 和 WebAuthn 依赖随 Go 二进制构建。
 
 ```sh
 go test -race -count=1 ./...
@@ -349,9 +375,9 @@ python3 tests/variables.py lacron:test
 node --test tests/checkin.test.cjs
 ```
 
-变量单元测试验证默认拒绝、授权快照、撤销、同名变量冲突、大小限制、文件权限、持久化与身份迁移。容器测试还实际检查不同 UID 的任务无法读取对方的 `/proc/<pid>/environ`、变量存储文件或未授权值，并验证定时执行和重启后的授权。签到示例通过本地模拟 API 验证真实 fetch 链路、过期 Cookie、超时、重定向拒绝和最终状态确认，不访问真实账号。
+变量单元测试验证授权隔离、身份迁移、明文导入、SQLite 加密存储和密钥轮换。容器测试还实际检查不同 UID 的任务无法读取对方的 `/proc/<pid>/environ`、变量存储文件或未授权值，并验证定时执行和重启后的授权。签到示例通过本地模拟 API 验证真实 fetch 链路、过期 Cookie、超时、重定向拒绝和最终状态确认，不访问真实账号。
 
-CI 还使用 Chromium 验证登录、任务与变量增删改、勾选授权及撤销、不回显值、预设、启停、手动运行、纯文本日志、搜索、主题持久化、移动端导航和退出登录，并上传浅色、深色和移动端截图作为检查记录。Playwright 仅用于测试，不进入运行镜像，也不需要前端构建。
+CI 还使用 Chromium 验证任务和变量管理、排序、复制、停止执行、增量日志、清理、系统设置、Passkey 注册与登录和会话撤销，并上传浅色、深色和移动端截图。Playwright 仅用于测试，不进入运行镜像，也不需要前端构建。
 
 ## 协议
 

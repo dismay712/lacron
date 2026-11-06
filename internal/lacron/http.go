@@ -2,8 +2,6 @@ package lacron
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -11,9 +9,8 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"strings"
+	"strconv"
 	"sync/atomic"
 )
 
@@ -46,22 +43,21 @@ func apiError(w http.ResponseWriter, err error) {
 	}
 }
 
-func decodeJob(w http.ResponseWriter, r *http.Request) (JobInput, error) {
-	var input JobInput
-	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
-	decoder := json.NewDecoder(r.Body)
+func decodeJSON(w http.ResponseWriter, r *http.Request, input any, limit int64) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&input); err != nil {
-		return input, err
+	if err := decoder.Decode(input); err != nil {
+		return err
 	}
 	if decoder.Decode(new(any)) != io.EOF {
-		return input, errors.New("请求必须为单个 JSON 对象")
+		return errors.New("请求必须为单个 JSON 对象")
 	}
-	return input, nil
+	return nil
 }
 
 func (s *Service) handler(ctx context.Context, token string, cronAlive *atomic.Bool, system map[string]any) http.Handler {
 	api := http.NewServeMux()
+	auth := newAuth(s, token)
 	api.HandleFunc("GET /api/variables", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, http.StatusOK, s.Variables())
 	})
@@ -71,10 +67,7 @@ func (s *Service) handler(ctx context.Context, token string, cronAlive *atomic.B
 			return
 		}
 		var input VariableInput
-		r.Body = http.MaxBytesReader(w, r.Body, 128<<10)
-		decoder := json.NewDecoder(r.Body)
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&input); err != nil || decoder.Decode(new(any)) != io.EOF {
+		if err := decodeJSON(w, r, &input, 128<<10); err != nil {
 			problem(w, http.StatusBadRequest, "JSON 格式无效或请求过大")
 			return
 		}
@@ -103,15 +96,20 @@ func (s *Service) handler(ctx context.Context, token string, cronAlive *atomic.B
 		for key, value := range system {
 			data[key] = value
 		}
+		settings := s.Settings()
 		data["cron_running"] = cronAlive.Load()
+		data["max_concurrent"] = settings.MaxConcurrent
+		data["max_runs"] = settings.MaxRuns
+		data["max_log_kib"] = settings.MaxLogKiB
+		data["encryption_configured"] = s.cipher != nil
 		respond(w, http.StatusOK, data)
 	})
 	api.HandleFunc("GET /api/jobs", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, http.StatusOK, s.Jobs())
 	})
 	api.HandleFunc("POST /api/jobs", func(w http.ResponseWriter, r *http.Request) {
-		input, err := decodeJob(w, r)
-		if err != nil {
+		var input JobInput
+		if err := decodeJSON(w, r, &input, 16<<10); err != nil {
 			problem(w, http.StatusBadRequest, "JSON 格式无效或请求过大")
 			return
 		}
@@ -123,8 +121,8 @@ func (s *Service) handler(ctx context.Context, token string, cronAlive *atomic.B
 		respond(w, http.StatusCreated, job)
 	})
 	api.HandleFunc("PUT /api/jobs/{id}", func(w http.ResponseWriter, r *http.Request) {
-		input, err := decodeJob(w, r)
-		if err != nil {
+		var input JobInput
+		if err := decodeJSON(w, r, &input, 16<<10); err != nil {
 			problem(w, http.StatusBadRequest, "JSON 格式无效或请求过大")
 			return
 		}
@@ -150,42 +148,133 @@ func (s *Service) handler(ctx context.Context, token string, cronAlive *atomic.B
 		}
 		respond(w, http.StatusAccepted, run)
 	})
-	api.HandleFunc("GET /api/runs", func(w http.ResponseWriter, r *http.Request) {
-		respond(w, http.StatusOK, s.Runs(r.URL.Query().Get("job_id")))
-	})
-	api.HandleFunc("GET /api/runs/{id}/log", func(w http.ResponseWriter, r *http.Request) {
-		data, err := s.Log(r.PathValue("id"))
+	api.HandleFunc("POST /api/jobs/{id}/copy", func(w http.ResponseWriter, r *http.Request) {
+		var input struct {
+			Name string `json:"name"`
+		}
+		if r.ContentLength != 0 && decodeJSON(w, r, &input, 4096) != nil {
+			problem(w, http.StatusBadRequest, "JSON 格式无效或请求过大")
+			return
+		}
+		job, err := s.CopyJob(r.PathValue("id"), input.Name)
 		if err != nil {
 			apiError(w, err)
 			return
 		}
-		respond(w, http.StatusOK, map[string]string{"output": string(data)})
+		respond(w, http.StatusCreated, job)
 	})
-	tokenHash := sha256.Sum256([]byte(token))
-	authorized := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		provided := ""
-		if value := r.Header.Get("Authorization"); strings.HasPrefix(value, "Bearer ") {
-			provided = strings.TrimPrefix(value, "Bearer ")
-		}
-		hash := sha256.Sum256([]byte(provided))
-		if subtle.ConstantTimeCompare(hash[:], tokenHash[:]) != 1 {
-			w.Header().Set("WWW-Authenticate", "Bearer")
-			problem(w, http.StatusUnauthorized, "访问令牌无效")
+	api.HandleFunc("GET /api/runs", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		job, status, cursor := query.Get("job_id"), query.Get("status"), query.Get("cursor")
+		if !query.Has("limit") && !query.Has("cursor") && !query.Has("status") {
+			respond(w, http.StatusOK, s.Runs(job))
 			return
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			if origin := r.Header.Get("Origin"); origin != "" {
-				u, err := url.Parse(origin)
-				if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host != r.Host {
-					problem(w, http.StatusForbidden, "拒绝跨站请求")
-					return
-				}
+		limit := 50
+		if query.Has("limit") {
+			var err error
+			limit, err = strconv.Atoi(query.Get("limit"))
+			if err != nil || limit < 1 || limit > 200 {
+				problem(w, http.StatusBadRequest, "分页大小须在 1–200 之间")
+				return
 			}
 		}
-		api.ServeHTTP(w, r)
+		page, err := s.RunsPage(job, status, cursor, limit)
+		if err != nil {
+			apiError(w, err)
+			return
+		}
+		respond(w, http.StatusOK, page)
 	})
+	api.HandleFunc("POST /api/runs/{id}/stop", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.StopRun(r.PathValue("id")); err != nil {
+			apiError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
+	api.HandleFunc("GET /api/runs/{id}/log", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		if !query.Has("offset") && !query.Has("limit") {
+			data, err := s.Log(r.PathValue("id"))
+			if err != nil {
+				apiError(w, err)
+				return
+			}
+			respond(w, http.StatusOK, map[string]string{"output": string(data)})
+			return
+		}
+		var offset int64
+		limit := 64 << 10
+		var err error
+		if query.Has("offset") {
+			offset, err = strconv.ParseInt(query.Get("offset"), 10, 64)
+			if err != nil || offset < 0 {
+				problem(w, http.StatusBadRequest, "日志偏移量无效")
+				return
+			}
+		}
+		if query.Has("limit") {
+			limit, err = strconv.Atoi(query.Get("limit"))
+			if err != nil || limit < 4 || limit > 128<<10 {
+				problem(w, http.StatusBadRequest, "日志分块大小须在 4–131072 字节之间")
+				return
+			}
+		}
+		chunk, err := s.ReadLog(r.PathValue("id"), offset, limit)
+		if err != nil {
+			apiError(w, err)
+			return
+		}
+		respond(w, http.StatusOK, chunk)
+	})
+	cleanup := func(preview bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			var input CleanupRequest
+			if decodeJSON(w, r, &input, 4096) != nil {
+				problem(w, http.StatusBadRequest, "清理参数格式无效")
+				return
+			}
+			result, err := s.CleanupLogs(input, preview)
+			if err != nil {
+				apiError(w, err)
+				return
+			}
+			respond(w, http.StatusOK, result)
+		}
+	}
+	api.HandleFunc("POST /api/runs/cleanup/preview", cleanup(true))
+	api.HandleFunc("POST /api/runs/cleanup", cleanup(false))
+	api.HandleFunc("GET /api/changes", func(w http.ResponseWriter, r *http.Request) {
+		respond(w, http.StatusOK, s.Changes())
+	})
+	api.HandleFunc("GET /api/settings", func(w http.ResponseWriter, r *http.Request) {
+		respond(w, http.StatusOK, s.Settings())
+	})
+	api.HandleFunc("PUT /api/settings", func(w http.ResponseWriter, r *http.Request) {
+		var input Settings
+		if decodeJSON(w, r, &input, 4096) != nil {
+			problem(w, http.StatusBadRequest, "设置格式无效")
+			return
+		}
+		settings, err := s.UpdateSettings(input)
+		if err != nil {
+			apiError(w, err)
+			return
+		}
+		respond(w, http.StatusOK, settings)
+	})
+	api.HandleFunc("GET /api/passkeys", auth.list)
+	api.HandleFunc("POST /api/passkeys/begin", func(w http.ResponseWriter, r *http.Request) { auth.begin(w, r, true) })
+	api.HandleFunc("POST /api/passkeys/finish", func(w http.ResponseWriter, r *http.Request) { auth.finish(w, r, true) })
+	api.HandleFunc("DELETE /api/passkeys/{id}", auth.remove)
 	mux := http.NewServeMux()
-	mux.Handle("/api/", authorized)
+	mux.Handle("/api/", auth.protect(api))
+	mux.HandleFunc("GET /api/auth/status", auth.status)
+	mux.HandleFunc("POST /api/auth/token", auth.tokenLogin)
+	mux.HandleFunc("POST /api/auth/logout", auth.logout)
+	mux.HandleFunc("POST /api/auth/passkey/begin", func(w http.ResponseWriter, r *http.Request) { auth.begin(w, r, false) })
+	mux.HandleFunc("POST /api/auth/passkey/finish", func(w http.ResponseWriter, r *http.Request) { auth.finish(w, r, false) })
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.CronEnabled && !cronAlive.Load() {
 			problem(w, http.StatusServiceUnavailable, "cron 未运行")

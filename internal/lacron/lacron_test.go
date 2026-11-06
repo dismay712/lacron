@@ -2,6 +2,7 @@ package lacron
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -14,17 +15,28 @@ import (
 	"time"
 )
 
+func testConfig(dir string) Config {
+	// On non-root developer machines, commands naturally run as the developer.
+	return Config{DataDir: dir, Executable: "/usr/local/bin/lacron", Timezone: "Asia/Shanghai", MaxConcurrent: 4, ScriptPath: os.Getenv("PATH"), RunUID: 10001, RunGID: 10001, EncryptionKey: []byte(strings.Repeat("a", 32))}
+}
+
 func testService(t *testing.T) (*Service, context.Context) {
 	t.Helper()
-	// On non-root developer machines, commands naturally run as the developer.
-	cfg := Config{DataDir: t.TempDir(), Executable: "/usr/local/bin/lacron", Timezone: "Asia/Shanghai", MaxConcurrent: 4, ScriptPath: os.Getenv("PATH"), RunUID: 10001, RunGID: 10001}
-	s, err := Open(cfg)
+	s, err := Open(testConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() { cancel(); s.Close() })
 	return s, ctx
+}
+
+func writeJSON(path string, value any) error {
+	b, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWrite(path, append(b, '\n'))
 }
 
 func testInput() JobInput {
@@ -139,10 +151,11 @@ func TestPersistenceAndLegacyCronMigration(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(s.cronDir(), "cron.update"), []byte("root\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(s.cfg)
+	reopened, err := Open(testConfig(s.cfg.DataDir))
 	if err != nil || len(reopened.Jobs()) != 1 || reopened.Jobs()[0].Command != in.Command {
 		t.Fatalf("persistence: %v", err)
 	}
+	reopened.Close()
 	cron, err := os.ReadFile(cronPath)
 	if err != nil || strings.Contains(string(cron), j.ID) || strings.Contains(string(cron), "malicious-command") {
 		t.Fatalf("legacy cron was not disabled: %s, %v", cron, err)
@@ -168,11 +181,7 @@ func TestPersistenceAndLegacyCronMigration(t *testing.T) {
 func TestFailedSavePreservesSchedule(t *testing.T) {
 	s, _ := testService(t)
 	j := saveTestJob(t, s, testInput())
-	path := filepath.Join(s.cfg.DataDir, "jobs.json")
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(path, 0700); err != nil {
+	if _, err := s.db.Exec(`CREATE TRIGGER test_fail_job BEFORE UPDATE ON jobs BEGIN SELECT RAISE(ABORT,'write failed'); END`); err != nil {
 		t.Fatal(err)
 	}
 	in := testInput()
@@ -248,7 +257,11 @@ func TestRunnerNoOverlapAndCancellation(t *testing.T) {
 
 func TestRunnerLogLimitAndConcurrency(t *testing.T) {
 	s, ctx := testService(t)
-	s.cfg.MaxConcurrent = 1
+	settings := s.Settings()
+	settings.MaxConcurrent, settings.MaxLogKiB = 1, 128
+	if _, err := s.UpdateSettings(settings); err != nil {
+		t.Fatal(err)
+	}
 	in := testInput()
 	in.Command = "sleep 1; head -c 400000 /dev/zero"
 	j := saveTestJob(t, s, in)
@@ -262,7 +275,7 @@ func TestRunnerLogLimitAndConcurrency(t *testing.T) {
 	}
 	run = waitRun(t, s, run.ID)
 	output, _ := s.Log(run.ID)
-	if !run.Truncated || len(output) != maxLogBytes || run.Status != "success" {
+	if !run.Truncated || len(output) != settings.MaxLogKiB<<10 || run.Status != "success" {
 		t.Fatalf("log cap: status=%s truncated=%t size=%d", run.Status, run.Truncated, len(output))
 	}
 }
@@ -270,9 +283,19 @@ func TestRunnerLogLimitAndConcurrency(t *testing.T) {
 func TestRecoveryAndRetention(t *testing.T) {
 	s, ctx := testService(t)
 	j := saveTestJob(t, s, testInput())
-	for i := 0; i < maxRuns; i++ {
-		s.runs = append(s.runs, Run{ID: newID(), JobID: j.ID, Status: "success"})
+	if err := s.transaction(func(tx *sql.Tx) error {
+		for i := 0; i < maxRuns; i++ {
+			run := Run{ID: newID(), JobID: j.ID, Status: "success"}
+			if err := writeRow(tx, saveRunRow, run.ID, run); err != nil {
+				return err
+			}
+			s.runs = append(s.runs, run)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
+	s.reindexRuns()
 	old := s.runs[0].ID
 	if err := os.WriteFile(filepath.Join(s.cfg.DataDir, "logs", old+".log"), []byte("old"), 0600); err != nil {
 		t.Fatal(err)
@@ -288,15 +311,18 @@ func TestRecoveryAndRetention(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(s.cfg.DataDir, "logs", old+".log")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("old log not pruned")
 	}
-	s.runs[0].Status = "running"
-	if err := writeJSON(filepath.Join(s.cfg.DataDir, "runs.json"), s.runs); err != nil {
+	unfinished := s.runs[0]
+	unfinished.Status = "running"
+	if err := writeRow(s.db, saveRunRow, unfinished.ID, unfinished); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(s.cfg)
+	s.Close()
+	reopened, err := Open(testConfig(s.cfg.DataDir))
 	if err != nil || reopened.runs[0].Status != "interrupted" {
 		t.Fatalf("recover interrupted run: %v", err)
 	}
-	if _, err := s.Log("../../etc/passwd"); !errors.Is(err, ErrNotFound) {
+	t.Cleanup(reopened.Close)
+	if _, err := reopened.Log("../../etc/passwd"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("log path traversal: %v", err)
 	}
 }
