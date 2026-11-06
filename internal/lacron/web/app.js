@@ -533,6 +533,7 @@ $('variable-form').addEventListener('submit', async (event) => {
   if (!state.editingVariable || $('variable-value').value !== '') input.value = $('variable-value').value;
   try {
     await api(state.editingVariable ? `/variables/${state.editingVariable}` : '/variables', { method: state.editingVariable ? 'PUT' : 'POST', body: JSON.stringify(input) });
+    $('variable-value').value = '';
     $('variable-dialog').close(); toast('变量与授权已保存'); await refresh(true);
   } catch (error) { setError('variable-error', error.message); } finally { $('save-variable').disabled = false; }
 });

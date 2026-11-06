@@ -153,7 +153,11 @@ async function main() {
     assert.deepEqual(pageErrors, []);
     console.log('WebUI: task and variable CRUD, sorting, copy, incremental logs, stop, cleanup, settings, Passkey, session revocation, themes and mobile: passed');
   } catch (error) {
-    if (page) await page.screenshot({ path: 'test-results/ui-failure.png', fullPage: true }).catch(() => {});
+    if (page) {
+      const errors = await page.locator('.form-error:visible').allTextContents().catch(() => []);
+      if (errors.length) console.error('Visible form errors:', errors);
+      await page.screenshot({ path: 'test-results/ui-failure.png', fullPage: true }).catch(() => {});
+    }
     try { console.error(docker('logs', name)); } catch { /* Keep original failure. */ }
     throw error;
   } finally {
