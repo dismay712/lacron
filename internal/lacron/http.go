@@ -2,9 +2,11 @@ package lacron
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -16,6 +18,23 @@ import (
 
 //go:embed web/*
 var webFiles embed.FS
+
+func webETags() map[string]string {
+	tags := make(map[string]string)
+	entries, _ := webFiles.ReadDir("web")
+	for _, entry := range entries {
+		data, err := webFiles.ReadFile("web/" + entry.Name())
+		if err != nil {
+			continue
+		}
+		path := "/" + entry.Name()
+		if path == "/index.html" {
+			path = "/"
+		}
+		tags[path] = fmt.Sprintf(`"%x"`, sha256.Sum256(data))
+	}
+	return tags
+}
 
 func respond(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -284,11 +303,16 @@ func (s *Service) handler(ctx context.Context, token string, cronAlive *atomic.B
 	})
 	static, _ := fs.Sub(webFiles, "web")
 	files := http.FileServer(http.FS(static))
+	tags := webETags()
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
+		}
+		if tag, ok := tags[r.URL.Path]; ok {
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("ETag", tag)
 		}
 		files.ServeHTTP(w, r)
 	}))

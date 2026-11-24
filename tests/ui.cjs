@@ -42,6 +42,9 @@ async function main() {
 
     await page.locator('#new-job').click();
     await page.locator('#job-name').fill('Node.js 状态检查');
+    assert.equal(await page.locator('#schedule-preset').inputValue(), '0 */5 * * * *');
+    await page.locator('#job-schedule').fill('7 15 9 * * *');
+    assert.equal(await page.locator('#schedule-preset').inputValue(), '');
     await page.locator('#schedule-preset').selectOption('*/5 * * * * *');
     assert.equal(await page.locator('#job-schedule').inputValue(), '*/5 * * * * *');
     await page.locator('#job-command').fill("node /scripts/hello.js\nprintf '<script>window.pwned=true</script>\\n'");
@@ -65,9 +68,16 @@ async function main() {
     assert((await page.locator('#log-output').innerText()).includes('<script>window.pwned=true</script>'));
     assert.equal(await page.evaluate(() => window.pwned), undefined, 'log HTML executed as script');
     await page.locator('#log-dialog .modal-footer .close-dialog').click();
+    assert(await page.evaluate(async () => {
+      const duration = document.querySelector('.run-duration').firstChild;
+      await refresh(true);
+      return duration.isConnected;
+    }), 'an idle poll replaced a completed run duration');
+    await exercisePagination(page);
     await page.locator('#nav-jobs').click();
 
     await page.locator('#job-rows .edit-job').click();
+    assert.equal(await page.locator('#schedule-preset').inputValue(), '*/5 * * * * *');
     await page.locator('#job-name').fill('Node.js 日常检查');
     await page.locator('#save-job').click();
     await page.locator('#job-dialog').waitFor({ state: 'hidden' });
@@ -91,6 +101,16 @@ async function main() {
     assert.equal(await page.locator('#variable-value').inputValue(), '');
     assert(!(await page.locator('body').innerText()).includes(sampleCookie));
     assert((await page.locator('#variable-rows .variable-grants').innerText()).includes('未授权'));
+    const variableButton = page.locator('#variable-rows .edit-variable');
+    await variableButton.focus();
+    const [job] = await page.evaluate(() => fetch('/api/jobs').then((response) => response.json()));
+    const status = await page.evaluate(async (id) => {
+      const response = await fetch(`/api/jobs/${id}/run`, { method: 'POST' });
+      return response.status;
+    }, job.id);
+    assert.equal(status, 202);
+    await page.evaluate(() => refresh(true));
+    assert(await variableButton.evaluate((button) => document.activeElement === button), 'a job run stole focus from the variable editor button');
     await page.locator('#variable-rows .edit-variable').click();
     assert.equal(await page.locator('#variable-value').inputValue(), '', 'secret must not be echoed when editing');
     await page.locator('#variable-job-options input').first().check();
@@ -163,6 +183,49 @@ async function main() {
   } finally {
     if (browser) await browser.close();
     try { docker('rm', '-fv', name); } catch { /* Container might not have started. */ }
+  }
+}
+
+async function exercisePagination(page) {
+  const run = await page.evaluate(async () => {
+    const response = await fetch('/api/runs?limit=1');
+    const { items } = await response.json();
+    return items[0];
+  });
+  const runsURL = /\/api\/runs\?/;
+  let failPrevious = false, release;
+  const delayPrevious = new Promise((resolve) => { release = resolve; });
+  await page.route(runsURL, async (route) => {
+    const cursor = new URL(route.request().url()).searchParams.get('cursor');
+    if (failPrevious && !cursor) {
+      failPrevious = false;
+      await delayPrevious;
+      return route.fulfill({ status: 503, json: { error: '分页请求暂时失败' } });
+    }
+    const pageIndex = Number(cursor || 1);
+    return route.fulfill({ json: {
+      items: [{ ...run, job_name: `第 ${pageIndex} 页记录` }],
+      next_cursor: pageIndex < 3 ? String(pageIndex + 1) : ''
+    } });
+  });
+  try {
+    await page.locator('#run-status-filter').selectOption('success');
+    await page.locator('.run-name').filter({ hasText: '第 1 页记录' }).waitFor();
+    await page.locator('#runs-next').click();
+    await page.locator('.run-name').filter({ hasText: '第 2 页记录' }).waitFor();
+    failPrevious = true;
+    await page.locator('#runs-prev').click();
+    assert(await page.locator('#runs-next').isDisabled(), 'next allowed a stale cursor while loading the previous page');
+    release();
+    await page.locator('#toast').filter({ hasText: '分页请求暂时失败' }).waitFor();
+    assert((await page.locator('#runs-count').textContent()).includes('第 2 页'));
+    await page.locator('#runs-prev').click();
+    await page.locator('.run-name').filter({ hasText: '第 1 页记录' }).waitFor();
+    assert(await page.locator('#runs-prev').isDisabled());
+  } finally {
+    release();
+    await page.unroute(runsURL);
+    await page.locator('#run-status-filter').selectOption('');
   }
 }
 

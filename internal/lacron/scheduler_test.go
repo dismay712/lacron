@@ -116,3 +116,26 @@ func TestLiveSecondSchedulerAndShutdown(t *testing.T) {
 		t.Fatalf("not second-resolution scheduling: %+v", runs)
 	}
 }
+
+func TestSchedulerRotatesWhenJobsCompeteForOneSlot(t *testing.T) {
+	s, ctx := testService(t)
+	settings := s.Settings()
+	settings.MaxConcurrent = 1
+	if _, err := s.UpdateSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	in := testInput()
+	in.Schedule = "* * * * * *"
+	first := saveTestJob(t, s, in)
+	second := saveTestJob(t, s, in)
+	third := saveTestJob(t, s, in)
+	now := time.Now()
+	for tick, want := range []Job{first, second, third, first} {
+		s.dispatchDue(ctx, now.Add(time.Duration(tick)*time.Second))
+		runs := s.Runs("")
+		if len(runs) != tick+1 || runs[0].JobID != want.ID {
+			t.Fatalf("tick %d: want job %s, got %+v", tick, want.ID, runs)
+		}
+		waitRun(t, s, runs[0].ID)
+	}
+}
