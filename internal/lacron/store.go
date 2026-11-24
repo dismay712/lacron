@@ -96,6 +96,7 @@ type Service struct {
 	location       *time.Location
 	schedules      map[string]Schedule
 	lastScheduled  map[string]int64
+	nextJobIndex   int
 	variables      []Variable
 	retiredSlots   map[uint32]bool
 	settings       Settings
@@ -354,6 +355,9 @@ func (s *Service) Delete(id string) error {
 		}
 		s.mu.Lock()
 		s.jobs = append(s.jobs[:i], s.jobs[i+1:]...)
+		if i < s.nextJobIndex {
+			s.nextJobIndex--
+		}
 		s.retiredSlots[job.RunSlot] = true
 		delete(s.schedules, id)
 		delete(s.lastScheduled, id)

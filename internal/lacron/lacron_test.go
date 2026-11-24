@@ -381,3 +381,37 @@ func TestHTTPAuthOriginCRUDAndHealth(t *testing.T) {
 		t.Fatalf("delete: %d", w.Code)
 	}
 }
+
+func TestStaticAssetRevalidation(t *testing.T) {
+	s, ctx := testService(t)
+	var alive atomic.Bool
+	h := s.handler(ctx, strings.Repeat("a", 32), &alive, nil)
+	get := func(path, tag string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.Header.Set("If-None-Match", tag)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	for _, path := range []string{"/", "/app.js", "/style.css", "/favicon.svg"} {
+		w := get(path, "")
+		tag := w.Header().Get("ETag")
+		if w.Code != http.StatusOK || w.Body.Len() == 0 || tag == "" || w.Header().Get("Cache-Control") != "no-cache" {
+			t.Fatalf("GET %s: %d, headers %v", path, w.Code, w.Header())
+		}
+		w = get(path, tag)
+		if w.Code != http.StatusNotModified || w.Body.Len() != 0 {
+			t.Fatalf("unchanged %s: %d, body %d bytes", path, w.Code, w.Body.Len())
+		}
+		w = get(path, `"previous-build"`)
+		if w.Code != http.StatusOK || w.Body.Len() == 0 {
+			t.Fatalf("changed %s: %d, body %d bytes", path, w.Code, w.Body.Len())
+		}
+	}
+	for _, path := range []string{"/api/auth/status", "/api/jobs", "/healthz"} {
+		w := get(path, "")
+		if w.Header().Get("ETag") != "" || w.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("GET %s: unexpected cache headers %v", path, w.Header())
+		}
+	}
+}

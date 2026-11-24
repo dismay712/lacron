@@ -61,7 +61,7 @@ const state = {
 function sessionData() {
   return {
     jobs: [], runs: [], variables: [], system: {}, changes: {}, revisions: {},
-    runJobs: new Map(), cursors: [''], runPage: 0, nextCursor: '', refreshing: null,
+    jobNames: new Map(), runJobs: new Map(), cursors: [''], runPage: 0, pendingRunPage: null, nextCursor: '', refreshing: null,
     settings: null, settingsDirty: false, passkeys: [], log: null, cleanup: null
   };
 }
@@ -109,7 +109,8 @@ function post(path, body) {
 }
 function connection(ok) {
   $('connection').querySelector('.status-dot').classList.toggle('offline', !ok);
-  $('connection-text').textContent = ok ? '已连接' : '连接中断';
+  const label = ok ? '已连接' : '连接中断';
+  if ($('connection-text').textContent !== label) $('connection-text').textContent = label;
 }
 const dateFormats = new Map();
 function date(value, long = false) {
@@ -155,7 +156,10 @@ function visit(view) {
 document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => visit(b.dataset.view)));
 document.querySelectorAll('[data-filter]').forEach((b) => b.addEventListener('click', () => {
   state.filter = b.dataset.filter;
-  document.querySelectorAll('[data-filter]').forEach((button) => button.classList.toggle('selected', button === b));
+  document.querySelectorAll('[data-filter]').forEach((button) => {
+    button.classList.toggle('selected', button === b);
+    button.setAttribute('aria-pressed', String(button === b));
+  });
   renderJobs();
 }));
 $('search').addEventListener('input', renderJobs);
@@ -196,6 +200,7 @@ function compareJobs(left, right) {
 }
 
 // Keep unchanged rows in place so background updates preserve focus.
+const rowVersions = new WeakMap();
 function syncRows(container, items, render) {
   const previous = new Map([...container.children].map((row) => [row.dataset.id, row]));
   let position = container.firstElementChild;
@@ -203,10 +208,13 @@ function syncRows(container, items, render) {
     const version = JSON.stringify(item);
     const old = previous.get(item.id);
     previous.delete(item.id);
-    const row = old?.dataset.version === version ? old : render(item);
-    row.dataset.id = item.id;
-    row.dataset.version = version;
-    if (old && row !== old) old.replaceWith(row);
+    let row = old;
+    if (!row || rowVersions.get(row) !== version) {
+      row = render(item);
+      row.dataset.id = item.id;
+      rowVersions.set(row, version);
+      if (old) old.replaceWith(row);
+    }
     if (position === old) position = row;
     if (row !== position) container.insertBefore(row, position);
     position = row.nextElementSibling;
@@ -235,7 +243,7 @@ function renderOverview() {
 }
 function renderRunOptions() {
   const selected = $('run-filter').value;
-  const options = new Map(state.jobs.map((j) => [j.id, j.name]));
+  const options = new Map(state.jobNames);
   state.runJobs.forEach((name, id) => {
     if (!options.has(id)) options.set(id, `${name}（已删除）`);
   });
@@ -306,6 +314,7 @@ function renderRuns() {
     row.querySelector('.run-source').textContent = run.source === 'cron' ? '定时调度' : '手动执行';
     row.querySelector('.run-start').textContent = date(run.started_at);
     row.querySelector('.run-start').title = date(run.started_at, true);
+    row.querySelector('.run-duration').textContent = duration(run);
     row.querySelector('.open-log').textContent = run.log_cleared ? '日志已清理' : '查看日志';
     row.querySelector('.open-log').setAttribute('aria-label', `查看 ${run.job_name} 的执行日志`);
     row.querySelector('.open-log').addEventListener('click', () => openLog(run));
@@ -319,7 +328,6 @@ function renderRuns() {
     hydrateIcons(row);
     return row;
   });
-  updateRunDurations();
   $('runs-table').hidden = !runs.length;
   $('runs-empty').hidden = !!runs.length;
   $('runs-count').textContent = runs.length ? `第 ${state.runPage + 1} 页 · ${runs.length} 条记录` : '暂无匹配的执行记录';
@@ -328,29 +336,39 @@ function renderRuns() {
 }
 function updateRunDurations() {
   const rows = $('run-rows').children;
-  state.runs.forEach((run, i) => { rows[i].querySelector('.run-duration').textContent = duration(run); });
+  state.runs.forEach((run, i) => {
+    if (run.status === 'running') rows[i].querySelector('.run-duration').textContent = duration(run);
+  });
 }
 function resetRunPage() {
   state.runQuery++;
   state.cursors = [''];
   state.runPage = 0;
+  state.pendingRunPage = null;
   state.nextCursor = '';
   state.runs = [];
   renderRuns();
 }
+async function changeRunPage(page) {
+  const query = ++state.runQuery;
+  state.pendingRunPage = page;
+  $('runs-prev').disabled = $('runs-next').disabled = true;
+  try {
+    await refresh(true);
+  } catch (error) {
+    if (state.pendingRunPage !== page || query !== state.runQuery) return;
+    state.pendingRunPage = null;
+    renderRuns();
+    toast(error.message, true);
+  }
+}
 $('runs-prev').addEventListener('click', () => {
-  if (state.runPage === 0) return;
-  state.runPage--;
-  state.runQuery++;
-  visit('runs');
+  if (state.runPage > 0) changeRunPage(state.runPage - 1);
 });
 $('runs-next').addEventListener('click', () => {
   if (!state.nextCursor) return;
-  state.cursors[++state.runPage] = state.nextCursor;
-  state.runQuery++;
-  state.nextCursor = '';
-  $('runs-next').disabled = true;
-  visit('runs');
+  state.cursors[state.runPage + 1] = state.nextCursor;
+  changeRunPage(state.runPage + 1);
 });
 function fetchRuns(cursor) {
   const query = new URLSearchParams({ limit: '50' });
@@ -386,7 +404,8 @@ async function refreshData(generation) {
   const needSystem = state.revisions.system !== key('settings');
   const needVariables = changed('variables');
   const needSettings = state.view === 'settings' && changed('settings');
-  const query = state.runQuery, runKey = `${key('runs')}:${query}`, cursor = state.cursors[state.runPage];
+  const query = state.runQuery, runKey = `${key('runs')}:${query}`;
+  const pageIndex = state.pendingRunPage ?? state.runPage, cursor = state.cursors[pageIndex];
   const needRuns = state.view === 'runs' && state.revisions.runs !== runKey;
   const [jobs, system, variables, settings, passkeys, page] = await Promise.all([
     needJobs && api('/jobs'),
@@ -400,6 +419,16 @@ async function refreshData(generation) {
     })
   ]);
   if (generation !== state.generation) return;
+  const countsChanged = changes.completed !== state.changes.completed || changes.successful !== state.changes.successful;
+  const namesChanged = jobs && (jobs.length !== state.jobNames.size || jobs.some((job) => state.jobNames.get(job.id) !== job.name));
+  if (namesChanged) {
+    const previousNames = state.jobNames;
+    state.jobNames = new Map(jobs.map((job) => [job.id, job.name]));
+    for (const [id, name] of previousNames) {
+      if (!state.jobNames.has(id) && (state.runJobs.has(id) || $('run-filter').value === id)) state.runJobs.set(id, name);
+    }
+  }
+  let runOptionsChanged = namesChanged;
   state.changes = changes;
   if (jobs) { state.jobs = jobs; state.revisions.jobs = key('jobs'); }
   if (system) { state.system = system; state.revisions.system = key('settings'); }
@@ -411,19 +440,25 @@ async function refreshData(generation) {
     renderSettings();
   }
   if (page && query === state.runQuery) {
-    if (page.reset) { state.cursors = ['']; state.runPage = 0; }
+    if (page.reset) state.cursors = [''];
+    state.runPage = page.reset ? 0 : pageIndex;
+    state.pendingRunPage = null;
     state.runs = page.items;
     state.nextCursor = page.next_cursor || '';
-    for (const run of state.runs) state.runJobs.set(run.job_id, run.job_name);
+    for (const run of state.runs) {
+      if (!state.runJobs.has(run.job_id)) {
+        state.runJobs.set(run.job_id, run.job_name);
+        if (!state.jobNames.has(run.job_id)) runOptionsChanged = true;
+      }
+    }
     state.revisions.runs = runKey;
     renderRuns();
-  } else if (state.view === 'runs') {
-    updateRunDurations();
   }
-  if (jobs || page) renderRunOptions();
+  if (state.view === 'runs') updateRunDurations();
+  if (runOptionsChanged) renderRunOptions();
   if (jobs) renderJobs();
-  if (jobs || variables) renderVariables();
-  renderOverview();
+  if (namesChanged || variables) renderVariables();
+  if (jobs || system || countsChanged) renderOverview();
   connection(true);
   if (state.log) updateLog().catch(() => {});
 }
@@ -435,6 +470,7 @@ function editJob(job = null) {
   $('save-job').textContent = job ? '保存更改' : '创建任务';
   $('job-name').value = job?.name || '';
   $('job-schedule').value = job?.schedule || '0 */5 * * * *';
+  syncSchedulePreset();
   $('job-command').value = job?.command || 'node /scripts/hello.js';
   $('job-directory').value = job?.working_dir || '/scripts';
   $('job-timeout').value = job?.timeout_sec || 300;
@@ -447,6 +483,12 @@ function editJob(job = null) {
 }
 $('new-job').addEventListener('click', () => editJob());
 $('empty-new-job').addEventListener('click', () => editJob());
+function syncSchedulePreset() {
+  const preset = $('schedule-preset');
+  preset.value = $('job-schedule').value.trim().replace(/\s+/g, ' ');
+  if (preset.selectedIndex === -1) preset.value = '';
+}
+$('job-schedule').addEventListener('input', syncSchedulePreset);
 $('schedule-preset').addEventListener('change', () => { if ($('schedule-preset').value) $('job-schedule').value = $('schedule-preset').value; });
 document.querySelectorAll('.close-dialog').forEach((b) => b.addEventListener('click', () => b.closest('dialog').close()));
 $('job-form').addEventListener('submit', async (event) => {
@@ -478,22 +520,21 @@ function confirmDelete(kind, item) {
 
 function renderVariables() {
   const query = $('variable-search').value.trim().toLocaleLowerCase();
-  const variables = state.variables.filter((v) => `${v.name} ${v.description}`.toLocaleLowerCase().includes(query));
-  const fragment = document.createDocumentFragment();
-  for (const variable of variables) {
-    const row = $('variable-row-template').content.cloneNode(true);
+  const variables = state.variables.filter((v) => `${v.name} ${v.description}`.toLocaleLowerCase().includes(query))
+    .map((v) => ({ ...v, grants: v.job_ids.map((id) => state.jobNames.get(id)).filter(Boolean) }));
+  syncRows($('variable-rows'), variables, (variable) => {
+    const row = $('variable-row-template').content.firstElementChild.cloneNode(true);
     row.querySelector('.variable-name').textContent = variable.name;
     row.querySelector('.variable-description').textContent = variable.description || '无描述';
-    const grants = state.jobs.filter((j) => variable.job_ids.includes(j.id)).map((j) => j.name);
-    row.querySelector('.variable-grants').textContent = grants.length ? grants.join('、') : '未授权任何任务';
+    row.querySelector('.variable-grants').textContent = variable.grants.length ? variable.grants.join('、') : '未授权任何任务';
     row.querySelector('.variable-updated').textContent = date(variable.updated_at);
     row.querySelector('.edit-variable').setAttribute('aria-label', `编辑变量 ${variable.name}`);
     row.querySelector('.edit-variable').addEventListener('click', () => editVariable(variable));
     row.querySelector('.delete-variable').setAttribute('aria-label', `删除变量 ${variable.name}`);
     row.querySelector('.delete-variable').addEventListener('click', () => confirmDelete('variables', variable));
-    hydrateIcons(row); fragment.append(row);
-  }
-  $('variable-rows').replaceChildren(fragment);
+    hydrateIcons(row);
+    return row;
+  });
   $('variables-table').hidden = !variables.length;
   $('variables-empty').hidden = !!variables.length;
   $('variables-empty').querySelector('h2').textContent = state.variables.length ? '没有找到匹配的变量。' : '配置一次，按需授权。';

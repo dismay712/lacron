@@ -2,6 +2,10 @@
 
 基于 Alpine 的轻量定时任务容器：Go 内置秒级 cron 调度器、管理 API 和 WebUI，支持 Node.js LTS 与 sh 脚本，可自行安装 Alpine 软件包。
 
+[快速启动](#快速启动) · [第一个任务与操作演示](#运行第一个任务) · [调度规则](#调度规则) · [API](#api)
+
+![lacron 任务调度页面，可查看每个任务的执行状态、Cron 表达式和下次执行时间](docs/images/dashboard.png)
+
 ## 功能
 
 - 简洁扁平化中文界面，支持浅色、深色和跟随系统，适配手机。
@@ -25,25 +29,41 @@ git clone https://github.com/dismay712/lacron.git
 cd lacron
 docker compose build --pull
 docker compose up -d
-# 未设置 LACRON_TOKEN 时，首次启动自动生成随机令牌；重启后保留。
+```
+
+默认配置会在首次启动时生成管理令牌。执行以下命令读取令牌，然后打开 <http://localhost:8080> 登录。如果配置了 `LACRON_TOKEN`，直接用配置的值登录。
+
+```sh
 docker compose exec lacron cat /data/admin.token
 ```
-
-打开 <http://localhost:8080>，输入令牌，点击「新建任务」。可以直接使用内置示例：
-
-```text
-名称：Node.js 示例
-Cron：*/5 * * * * *
-命令：node /scripts/hello.js
-工作目录：/scripts
-超时：300 秒
-```
-
-这个例子每 5 秒执行一次。Shell 示例命令：`sh /scripts/hello.sh`，也可以直接填写多行 sh 命令。将自己的脚本放到仓库的 `scripts/` 目录即可，Compose 将它只读挂载到容器 `/scripts`；这个挂载不影响根文件系统安装软件包。脚本文件及父目录必须允许对应任务 UID 读取、遍历（普通脚本可使用文件 `0644`、目录 `0755`）。需要第三方 npm 包时，可在自定义镜像构建期间安装到脚本项目中。
 
 Compose 默认时区为 `Asia/Shanghai`，仅绑定宿主机 `127.0.0.1:8080`。远程访问可使用 SSH 端口转发或配置 HTTPS 反向代理。代理应保留 `Host` 和 `Authorization` 请求头。管理令牌有执行容器内命令的权限，请只交给可信管理员。
 
 可复制 `.env.example` 为 `.env` 调整端口、时区、初始并发数和令牌。自定义令牌至少 24 字节且无空白。WebUI 登录后使用 12 小时有效的 HttpOnly 会话 Cookie。退出登录或重启服务会使会话失效。
+
+## 运行第一个任务
+
+用一条 Node.js 命令打印问候语，验证从创建任务到查看日志的完整流程。
+
+1. 登录后，在「任务调度」点「新建任务」，将任务名称填为 `Node.js 示例`。
+2. 在「常用预设」选「每分钟」。确认表单中的参数如下，取消勾选「启用定时调度」，再点「创建任务」。这样可以先手动测试一次。
+
+   | 字段 | 值 |
+   | --- | --- |
+   | Cron 表达式 | `0 * * * * *`（每分钟的第 0 秒） |
+   | 执行命令 | `node -e "console.log('Hello from lacron!')"` |
+   | 工作目录 | `/` |
+   | 超时时间 | `300` 秒 |
+
+3. 在该任务行点三角形「立即执行」按钮。等「最近执行」显示「成功」后，点同一行的「查看记录」，再点「查看日志」。确认退出码为 `0`，日志中有一行 `Hello from lacron!`。
+
+![操作演示：创建 Node.js 示例，手动执行并查看脚本输出](docs/images/first-run.gif)
+
+**试试自动调度。** 返回「任务调度」，打开该任务的状态开关，查看「下次执行」时间。到点后再打开「查看记录」，新记录的来源应为「定时调度」。体验完可关闭开关暂停后续调度。
+
+**改用脚本文件。** 把执行命令换成 `node /scripts/hello.js`，即可运行镜像自带的 [hello.js](scripts/hello.js)。这次除了问候语，还会输出执行时间、Node.js 版本和任务进程的 UID/GID。Shell 示例可用 `sh /scripts/hello.sh`，也可以直接填写多行 sh 命令。
+
+将自己的脚本放到仓库的 `scripts/` 目录，Compose 会将该目录只读挂载到容器的 `/scripts`。任务 UID 需要能够读取脚本并遍历父目录，普通脚本可使用文件权限 `0644`、目录权限 `0755`。需要第三方 npm 包时，可在自定义镜像构建期间安装到脚本项目中。
 
 ## 系统设置与 Passkey
 

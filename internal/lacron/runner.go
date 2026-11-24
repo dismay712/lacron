@@ -145,12 +145,21 @@ func (s *Service) dispatchDue(ctx context.Context, now time.Time) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	now = now.In(s.location)
-	for _, job := range s.jobs {
+	start := s.nextJobIndex
+	for offset := range s.jobs {
+		if len(s.active) >= s.settings.MaxConcurrent {
+			return
+		}
+		index := (start + offset) % len(s.jobs)
+		job := s.jobs[index]
 		if !job.Enabled || !s.schedules[job.ID].Matches(now) {
 			continue
 		}
-		if _, err := s.startLocked(ctx, job, "cron", now); err != nil &&
-			!errors.Is(err, ErrBusy) && !errors.Is(err, ErrStale) && !errors.Is(err, ErrClosing) {
+		_, err := s.startLocked(ctx, job, "cron", now)
+		if err == nil {
+			// Give the next due job the first chance at a slot on the next tick.
+			s.nextJobIndex = index + 1
+		} else if !errors.Is(err, ErrBusy) && !errors.Is(err, ErrStale) && !errors.Is(err, ErrClosing) {
 			log.Printf("schedule job=%s: %v", job.ID, err)
 		}
 	}
