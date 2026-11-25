@@ -29,7 +29,7 @@ async function main() {
     }
     assert(ready, 'container did not become healthy');
     browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, locale: 'zh-CN', timezoneId: 'Asia/Shanghai' });
+    const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, locale: 'zh-CN', timezoneId: 'UTC' });
     page = await context.newPage();
     const pageErrors = [];
     page.on('pageerror', (error) => pageErrors.push(error.message));
@@ -43,10 +43,18 @@ async function main() {
     await page.locator('#new-job').click();
     await page.locator('#job-name').fill('Node.js 状态检查');
     assert.equal(await page.locator('#schedule-preset').inputValue(), '0 */5 * * * *');
+    await assertPreviewInterval(page, 300);
+    await page.locator('#job-schedule').fill('invalid');
+    await page.locator('#job-schedule[aria-invalid=true]').waitFor();
+    assert.equal(await page.locator('#schedule-preview-times time').count(), 0);
+    assert((await page.locator('#schedule-preview-status').innerText()).length > 0);
     await page.locator('#job-schedule').fill('7 15 9 * * *');
     assert.equal(await page.locator('#schedule-preset').inputValue(), '');
+    await assertPreviewInterval(page, 86400);
+    assert((await page.locator('#schedule-preview-times time').first().innerText()).includes('09:15:07'));
     await page.locator('#schedule-preset').selectOption('*/5 * * * * *');
     assert.equal(await page.locator('#job-schedule').inputValue(), '*/5 * * * * *');
+    await assertPreviewInterval(page, 5);
     await page.locator('#job-command').fill("node /scripts/hello.js\nprintf '<script>window.pwned=true</script>\\n'");
     await page.locator('#job-timeout').fill('10');
     await page.locator('#job-enabled').uncheck();
@@ -63,13 +71,19 @@ async function main() {
     await page.locator('#job-rows .run-job').click();
     await page.locator('#job-rows .badge.success').waitFor({ timeout: 20000 });
     await page.locator('#job-rows .job-history').click();
-    await page.locator('#run-rows .open-log').first().click();
+    await page.locator('#history-rows .open-log').first().click();
+    await page.locator('#log-path').filter({ hasText: 'Node.js 状态检查' }).waitFor();
     await page.waitForFunction(() => document.querySelector('#log-output').textContent.includes('uid=10001 gid=10001'));
     assert((await page.locator('#log-output').innerText()).includes('<script>window.pwned=true</script>'));
     assert.equal(await page.evaluate(() => window.pwned), undefined, 'log HTML executed as script');
     await page.locator('#log-dialog .modal-footer .close-dialog').click();
+    await page.keyboard.press('Escape');
+    await page.locator('#history-dialog').waitFor({ state: 'hidden' });
+    assert(await page.locator('#jobs-view').isVisible());
+    await page.locator('#nav-runs').click();
+    await page.locator('#run-rows .open-log').first().waitFor();
     assert(await page.evaluate(async () => {
-      const duration = document.querySelector('.run-duration').firstChild;
+      const duration = document.querySelector('#run-rows .run-duration').firstChild;
       await refresh(true);
       return duration.isConnected;
     }), 'an idle poll replaced a completed run duration');
@@ -78,6 +92,7 @@ async function main() {
 
     await page.locator('#job-rows .edit-job').click();
     assert.equal(await page.locator('#schedule-preset').inputValue(), '*/5 * * * * *');
+    await assertPreviewInterval(page, 5);
     await page.locator('#job-name').fill('Node.js 日常检查');
     await page.locator('#save-job').click();
     await page.locator('#job-dialog').waitFor({ state: 'hidden' });
@@ -161,6 +176,14 @@ async function main() {
     await page.locator('#confirm-dialog').waitFor({ state: 'hidden' });
     await page.waitForFunction(() => document.querySelector('#variables-count').textContent === '共 0 个变量');
     await page.locator('.mobile-nav [data-view=jobs]').click();
+    await page.locator('#job-rows .latest-log').click();
+    await page.locator('#log-output').filter({ hasText: 'uid=10001 gid=10001' }).waitFor();
+    assert(!(await page.locator('#history-dialog').isVisible()));
+    await page.keyboard.press('Escape');
+    await page.locator('#job-rows .job-history').click();
+    await page.locator('#history-rows .open-log').first().waitFor();
+    assert(await page.locator('#history-dialog').evaluate((dialog) => dialog.scrollWidth <= dialog.clientWidth), 'mobile history dialog overflows');
+    await page.keyboard.press('Escape');
     await page.locator('#job-rows .delete-job').click();
     await page.locator('#confirm-delete').click();
     await page.locator('#confirm-dialog').waitFor({ state: 'hidden' });
@@ -184,6 +207,15 @@ async function main() {
     if (browser) await browser.close();
     try { docker('rm', '-fv', name); } catch { /* Container might not have started. */ }
   }
+}
+
+async function assertPreviewInterval(page, seconds) {
+  const times = page.locator('#schedule-preview-times time');
+  await times.nth(4).waitFor();
+  const values = await times.evaluateAll((items) => items.map((time) => Date.parse(time.dateTime)));
+  assert.equal(values.length, 5);
+  assert(values.slice(1).every((value, index) => value - values[index] === seconds * 1000));
+  assert((await page.locator('#schedule-preview-zone').innerText()).includes('Asia/Shanghai'));
 }
 
 async function exercisePagination(page) {
@@ -210,9 +242,9 @@ async function exercisePagination(page) {
   });
   try {
     await page.locator('#run-status-filter').selectOption('success');
-    await page.locator('.run-name').filter({ hasText: '第 1 页记录' }).waitFor();
+    await page.locator('#run-rows .run-name').filter({ hasText: '第 1 页记录' }).waitFor();
     await page.locator('#runs-next').click();
-    await page.locator('.run-name').filter({ hasText: '第 2 页记录' }).waitFor();
+    await page.locator('#run-rows .run-name').filter({ hasText: '第 2 页记录' }).waitFor();
     failPrevious = true;
     await page.locator('#runs-prev').click();
     assert(await page.locator('#runs-next').isDisabled(), 'next allowed a stale cursor while loading the previous page');
@@ -220,7 +252,7 @@ async function exercisePagination(page) {
     await page.locator('#toast').filter({ hasText: '分页请求暂时失败' }).waitFor();
     assert((await page.locator('#runs-count').textContent()).includes('第 2 页'));
     await page.locator('#runs-prev').click();
-    await page.locator('.run-name').filter({ hasText: '第 1 页记录' }).waitFor();
+    await page.locator('#run-rows .run-name').filter({ hasText: '第 1 页记录' }).waitFor();
     assert(await page.locator('#runs-prev').isDisabled());
   } finally {
     release();
@@ -254,6 +286,28 @@ async function exerciseOptimizations(page, context, base) {
   const copy = jobs.find((job) => job.name === 'A 任务副本');
   assert(!copy.enabled && copy.run_uid !== original.run_uid && copy.command === original.command);
 
+  const copyRow = page.locator('#job-rows tr').filter({ hasText: copy.name });
+  await copyRow.locator('.job-history').click();
+  await page.locator('#history-empty').waitFor();
+  await page.locator('#history-edit').click();
+  assert.equal(await page.locator('#job-name').inputValue(), copy.name);
+  await page.locator('#job-command').fill("printf 'copy output'");
+  await page.locator('#save-job').click();
+  await page.locator('#job-dialog').waitFor({ state: 'hidden' });
+  assert(await page.locator('#history-dialog').isVisible());
+  await page.keyboard.press('Escape');
+  await copyRow.locator('.run-job').click();
+  await copyRow.locator('.badge.success').waitFor({ timeout: 20000 });
+
+  // Retain a different query in the independent, all-tasks execution view.
+  await page.locator('#nav-runs').click();
+  await page.locator('#run-filter').selectOption(copy.id);
+  await page.locator('#run-status-filter').selectOption('success');
+  await page.locator('#run-rows .run-name').filter({ hasText: copy.name }).waitFor();
+  await page.locator('#nav-jobs').click();
+  await page.locator('[data-filter=paused]').click();
+  await page.locator('#search').fill(original.name);
+
   const offsets = [];
   const recordOffset = (req) => {
     const url = new URL(req.url());
@@ -263,7 +317,8 @@ async function exerciseOptimizations(page, context, base) {
   const row = page.locator('#job-rows tr').filter({ hasText: original.name });
   await row.locator('.run-job').click();
   await row.locator('.job-history').click();
-  await page.locator('#run-rows .open-log').first().click();
+  assert.equal(await page.locator('#history-job').inputValue(), original.id);
+  await page.locator('#history-rows .open-log').first().click();
   await page.waitForFunction(() => document.querySelector('#log-output').textContent.includes('first output'));
   await page.waitForFunction(() => document.querySelector('#log-output').textContent.includes('second output'), null, { timeout: 16000 });
   assert(offsets.some((offset) => offset > 0), 'log did not resume from a byte offset');
@@ -280,6 +335,24 @@ async function exerciseOptimizations(page, context, base) {
   await page.locator('#cleanup-dialog').waitFor({ state: 'hidden' });
   await page.locator('#log-output').filter({ hasText: '本次日志已清理' }).waitFor();
   await page.locator('#log-dialog .modal-footer .close-dialog').click();
+  await page.locator('#history-job').selectOption(copy.id);
+  await page.locator('#history-path').filter({ hasText: copy.name }).waitFor();
+  await page.locator('#history-rows .open-log').first().click();
+  await page.locator('#log-output').filter({ hasText: 'copy output' }).waitFor();
+  assert(!(await page.locator('#log-output').innerText()).includes('first output'));
+  await page.keyboard.press('Escape');
+  await page.locator('#log-dialog').waitFor({ state: 'hidden' });
+  assert.equal(await page.locator('#history-job').inputValue(), copy.id);
+  await page.keyboard.press('Escape');
+  await page.locator('#history-dialog').waitFor({ state: 'hidden' });
+  assert(await page.locator('#jobs-view').isVisible());
+  assert.equal(await page.locator('#search').inputValue(), original.name);
+  assert.equal(await page.locator('[data-filter=paused]').getAttribute('aria-pressed'), 'true');
+  assert.deepEqual(await page.locator('#job-rows .job-name').allTextContents(), [original.name]);
+  await page.locator('#nav-runs').click();
+  assert.equal(await page.locator('#run-filter').inputValue(), copy.id);
+  assert.equal(await page.locator('#run-status-filter').inputValue(), 'success');
+  await page.locator('#run-filter').selectOption(original.id);
   await page.locator('#run-status-filter').selectOption('cancelled');
   await page.locator('#run-rows .badge.cancelled').waitFor();
 

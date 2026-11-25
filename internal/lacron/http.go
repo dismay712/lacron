@@ -13,7 +13,9 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
+	"time"
 )
 
 //go:embed web/*
@@ -122,6 +124,26 @@ func (s *Service) handler(ctx context.Context, token string, cronAlive *atomic.B
 		data["max_log_kib"] = settings.MaxLogKiB
 		data["encryption_configured"] = s.cipher != nil
 		respond(w, http.StatusOK, data)
+	})
+	api.HandleFunc("GET /api/cron/preview", func(w http.ResponseWriter, r *http.Request) {
+		expression := strings.Join(strings.Fields(r.URL.Query().Get("schedule")), " ")
+		schedule, err := ParseSchedule(expression)
+		if err != nil {
+			problem(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		const count = 5
+		times := make([]time.Time, 0, count)
+		after := time.Now().In(s.location)
+		for len(times) < count {
+			next := schedule.Next(after)
+			if next.IsZero() {
+				break
+			}
+			times = append(times, next)
+			after = next
+		}
+		respond(w, http.StatusOK, map[string]any{"timezone": s.location.String(), "times": times})
 	})
 	api.HandleFunc("GET /api/jobs", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, http.StatusOK, s.Jobs())

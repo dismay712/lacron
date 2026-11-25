@@ -213,15 +213,27 @@ tbody tr:hover { background: var(--subtle); }
 #runs-limit { margin-top: 3px; }
 
 /* Dialogs, configuration and logs */
+html { scrollbar-gutter: stable; }
+html:has(dialog[open]) { overflow: hidden; }
 .modal { width: min(570px, calc(100vw - 24px)); max-height: 90dvh; padding: 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
 .modal::backdrop { background: #0a1a15aa; }
 .modal-heading, .modal-footer { padding: 15px 22px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .modal-heading { border-bottom: 1px solid var(--border); }
 .modal-heading h2 { overflow-wrap: anywhere; }
 .modal-body { padding: 18px 22px; display: flex; flex-direction: column; gap: 7px; }
+#job-form { display: flex; flex-direction: column; max-height: calc(90dvh - 2px); }
+#job-form > .modal-body { overflow-y: auto; overscroll-behavior: contain; }
+#job-form > .modal-heading, #job-form > .modal-footer { flex: none; }
 .modal-body > label:not(:first-child), .field-heading { margin-top: 8px; }
 .field-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .field-heading select { font-size: 12px; padding: 4px 7px; }
+.schedule-preview { padding: 8px 12px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--subtle); font-size: 12px; }
+.schedule-preview-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.schedule-preview-heading button { color: var(--accent-ink); padding: 4px 6px; }
+#schedule-preview-status.error { color: var(--danger); }
+#schedule-preview-times { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 205px), 1fr)); gap: 3px 12px; margin: 5px 0 0; padding: 0; list-style: none; font-variant-numeric: tabular-nums; }
+#schedule-preview-times:empty { display: none; }
+.schedule-offset { margin-inline-start: 6px; color: var(--muted); font-size: 11px; }
 .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 8px; }
 .field-grid > div { display: grid; gap: 5px; }
 .checkbox-field, .grant-option { display: flex; gap: 9px; align-items: flex-start; }
@@ -234,6 +246,26 @@ tbody tr:hover { background: var(--subtle); }
 .form-error { color: var(--danger); background: var(--danger-soft); }
 .log-notice { color: var(--warning); background: var(--warning-soft); margin: 10px 15px; }
 .log-modal { width: min(860px, calc(100vw - 24px)); }
+.dialog-path { color: var(--muted); font-size: 12px; margin-bottom: 3px; overflow-wrap: anywhere; }
+.history-modal { width: min(920px, calc(100vw - 24px)); }
+.history-modal[open] { display: flex; flex-direction: column; }
+.history-modal > :not(.history-body) { flex: none; }
+.history-tools { display: flex; align-items: end; flex-wrap: wrap; gap: 8px 14px; padding: 13px 20px; border-bottom: 1px solid var(--border); }
+.history-tools label { display: grid; gap: 3px; min-width: 0; font-size: 12px; color: var(--muted); }
+.history-tools label:first-child { flex: 1 1 150px; }
+.history-tools select { min-width: 0; width: 100%; min-height: 35px; color: var(--text); }
+.history-tools .button { min-height: 35px; padding-block: 5px; }
+.history-body { overflow: auto; overscroll-behavior: contain; }
+.history-placeholder { padding: 36px 12px; text-align: center; color: var(--muted); }
+#history-error { margin: 12px; }
+.latest-log { display: inline-flex; align-items: center; gap: 5px; padding: 2px 0; border: 0; border-radius: 5px; background: transparent; color: var(--muted); }
+.latest-log svg { width: 13px; height: 13px; }
+.latest-log:hover { color: var(--accent-ink); }
+.latest-log:hover .badge { text-decoration: underline; text-underline-offset: 2px; }
+.history-modal .table-scroll { overflow: visible; }
+@media (max-height: 520px) {
+  .history-modal[open] { display: block; }
+}
 .log-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; padding: 14px 20px; font-size: 12px; color: var(--muted); }
 #log-output { margin: 0 15px 15px; padding: 14px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; min-height: 200px; max-height: 45dvh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; }
 .confirm-modal { max-width: 440px; }
