@@ -56,12 +56,15 @@ const state = {
   active: false, generation: 0, filter: 'all', view: 'jobs',
   sort: sortFields.includes(storage.get('lacron-sort')) ? storage.get('lacron-sort') : 'created',
   descending: storage.get('lacron-sort-descending') === 'true',
-  runQuery: 0, ...sessionData()
+  ...sessionData()
 };
+function runList(scope, jobId = '', status = '') {
+  return { scope, jobId, status, items: [], page: 0, cursors: [''], nextCursor: '', revision: null, loading: false };
+}
 function sessionData() {
   return {
-    jobs: [], runs: [], variables: [], system: {}, changes: {}, revisions: {},
-    jobNames: new Map(), runJobs: new Map(), cursors: [''], runPage: 0, pendingRunPage: null, nextCursor: '', refreshing: null,
+    jobs: [], variables: [], system: {}, changes: {}, revisions: {},
+    jobNames: new Map(), runJobs: new Map(), globalRuns: runList('runs'), history: null, refreshing: null,
     settings: null, settingsDirty: false, passkeys: [], log: null, cleanup: null
   };
 }
@@ -80,7 +83,7 @@ function showLogin() {
   state.generation++;
   Object.assign(state, sessionData());
   document.querySelectorAll('dialog[open]').forEach((d) => d.close());
-  for (const id of ['job-rows', 'run-rows', 'variable-rows', 'passkey-list', 'log-output', 'log-meta', 'variable-job-options']) $(id).replaceChildren();
+  for (const id of ['job-rows', 'run-rows', 'history-rows', 'history-job', 'history-path', 'log-path', 'variable-rows', 'passkey-list', 'log-output', 'log-meta', 'variable-job-options']) $(id).replaceChildren();
   $('run-filter').replaceChildren(new Option('全部任务', ''));
   $('run-status-filter').value = '';
   $('workspace').hidden = true;
@@ -138,6 +141,7 @@ const views = {
 };
 function setView(view) {
   state.view = view;
+  if (view === 'runs') renderRuns(state.globalRuns);
   for (const name of Object.keys(views)) $(`${name}-view`).hidden = view !== name;
   $('overview-metrics').hidden = view !== 'jobs' && view !== 'runs';
   $('new-job').hidden = view !== 'jobs';
@@ -165,7 +169,11 @@ document.querySelectorAll('[data-filter]').forEach((b) => b.addEventListener('cl
 $('search').addEventListener('input', renderJobs);
 $('variable-search').addEventListener('input', renderVariables);
 for (const id of ['run-filter', 'run-status-filter']) {
-  $(id).addEventListener('change', () => { resetRunPage(); visit('runs'); });
+  $(id).addEventListener('change', () => {
+    state.globalRuns = runList('runs', $('run-filter').value, $('run-status-filter').value);
+    renderRuns(state.globalRuns);
+    loadRunPage(state.globalRuns);
+  });
 }
 $('job-sort').value = state.sort;
 function renderSortDirection() {
@@ -261,8 +269,21 @@ function renderJobs() {
     row.querySelector('.job-command').textContent = job.command.replace(/\s+/g, ' ');
     row.querySelector('.job-command').title = job.command;
     row.querySelector('.schedule-code').textContent = job.schedule;
-    row.querySelector('.job-last').append(badge(job.running ? 'running' : job.last_run?.status));
-    row.querySelector('.job-last').title = job.last_run ? date(job.last_run.started_at, true) : '';
+    const last = row.querySelector('.job-last'), status = badge(job.running ? 'running' : job.last_run?.status);
+    if (job.last_run) {
+      const latest = document.createElement('button');
+      latest.type = 'button';
+      latest.className = 'latest-log';
+      latest.title = `查看最近一次执行日志 · ${date(job.last_run.started_at, true)}`;
+      latest.setAttribute('aria-label', `查看 ${job.name} 最近一次执行日志（${status.textContent}）`);
+      latest.setAttribute('aria-haspopup', 'dialog');
+      latest.innerHTML = icon('file');
+      latest.prepend(status);
+      latest.addEventListener('click', () => openLog(job.last_run, latest));
+      last.append(latest);
+    } else {
+      last.append(status);
+    }
     row.querySelector('.job-next').textContent = job.enabled ? (job.next_run ? date(job.next_run) : '未来 8 年无匹配时间') : '已暂停';
     const toggle = row.querySelector('.toggle');
     toggle.setAttribute('aria-checked', String(job.enabled));
@@ -279,12 +300,7 @@ function renderJobs() {
     row.querySelector('.edit-job').setAttribute('aria-label', `编辑 ${job.name}`);
     row.querySelector('.edit-job').addEventListener('click', () => editJob(job));
     row.querySelector('.job-history').setAttribute('aria-label', `查看 ${job.name} 的执行记录`);
-    row.querySelector('.job-history').addEventListener('click', () => {
-      $('run-filter').value = job.id;
-      $('run-status-filter').value = '';
-      resetRunPage();
-      visit('runs');
-    });
+    row.querySelector('.job-history').addEventListener('click', () => openHistory(job));
     const stop = row.querySelector('.stop-job');
     stop.hidden = !job.running || !job.last_run;
     stop.setAttribute('aria-label', `停止 ${job.name} 的当前执行`);
@@ -304,79 +320,159 @@ function renderJobs() {
   $('empty-new-job').hidden = state.jobs.length !== 0;
   $('jobs-count').textContent = jobs.length === state.jobs.length ? `共 ${jobs.length} 个任务` : `显示 ${jobs.length} / ${state.jobs.length} 个任务`;
 }
-function renderRuns() {
-  const runs = state.runs;
-  syncRows($('run-rows'), runs, (run) => {
-    const row = $('run-row-template').content.firstElementChild.cloneNode(true);
-    row.querySelector('.run-name').textContent = run.job_name;
-    row.querySelector('.run-name').title = run.job_name;
-    row.querySelector('.run-status').append(badge(run.status));
-    row.querySelector('.run-source').textContent = run.source === 'cron' ? '定时调度' : '手动执行';
-    row.querySelector('.run-start').textContent = date(run.started_at);
-    row.querySelector('.run-start').title = date(run.started_at, true);
-    row.querySelector('.run-duration').textContent = duration(run);
-    row.querySelector('.open-log').textContent = run.log_cleared ? '日志已清理' : '查看日志';
-    row.querySelector('.open-log').setAttribute('aria-label', `查看 ${run.job_name} 的执行日志`);
-    row.querySelector('.open-log').addEventListener('click', () => openLog(run));
-    const stop = row.querySelector('.stop-run');
-    stop.hidden = run.status !== 'running';
-    stop.addEventListener('click', () => stopRun(run.id, stop));
-    const clean = row.querySelector('.clean-run');
-    clean.hidden = run.status === 'running';
-    clean.setAttribute('aria-label', `清理 ${run.job_name} 的执行记录`);
-    clean.addEventListener('click', () => openCleanup(run));
-    hydrateIcons(row);
-    return row;
-  });
-  $('runs-table').hidden = !runs.length;
-  $('runs-empty').hidden = !!runs.length;
-  $('runs-count').textContent = runs.length ? `第 ${state.runPage + 1} 页 · ${runs.length} 条记录` : '暂无匹配的执行记录';
-  $('runs-prev').disabled = state.runPage === 0;
-  $('runs-next').disabled = !state.nextCursor;
+function renderRunRow(run) {
+  const row = $('run-row-template').content.firstElementChild.cloneNode(true);
+  row.querySelector('.run-name').textContent = run.job_name;
+  row.querySelector('.run-name').title = run.job_name;
+  row.querySelector('.run-status').append(badge(run.status));
+  row.querySelector('.run-source').textContent = run.source === 'cron' ? '定时调度' : '手动执行';
+  row.querySelector('.run-start').textContent = date(run.started_at);
+  row.querySelector('.run-start').title = date(run.started_at, true);
+  row.querySelector('.run-duration').textContent = duration(run);
+  const logButton = row.querySelector('.open-log');
+  logButton.textContent = run.log_cleared ? '日志已清理' : '查看日志';
+  logButton.setAttribute('aria-label', `查看 ${run.job_name} 的执行日志`);
+  logButton.addEventListener('click', () => openLog(run, logButton));
+  const stop = row.querySelector('.stop-run');
+  stop.hidden = run.status !== 'running';
+  stop.addEventListener('click', () => stopRun(run.id, stop));
+  const clean = row.querySelector('.clean-run');
+  clean.hidden = run.status === 'running';
+  clean.setAttribute('aria-label', `清理 ${run.job_name} 的执行记录`);
+  clean.addEventListener('click', () => openCleanup(run));
+  hydrateIcons(row);
+  return row;
 }
-function updateRunDurations() {
-  const rows = $('run-rows').children;
-  state.runs.forEach((run, i) => {
+function runRows(list) {
+  return $(list.scope === 'runs' ? 'run-rows' : 'history-rows');
+}
+function renderRuns(list) {
+  const { scope, items } = list;
+  syncRows(runRows(list), items, renderRunRow);
+  $(`${scope}-table`).hidden = !items.length;
+  $(`${scope}-empty`).hidden = !!items.length;
+  if (scope === 'history') {
+    $('history-empty').textContent = list.loading ? '正在读取执行记录…' : list.status ? '该任务没有此状态的执行记录。' : '该任务暂无执行记录。';
+    if (list.error) $('history-empty').hidden = true;
+    setError('history-error', list.error);
+  }
+  const count = items.length ? `第 ${list.page + 1} 页 · ${items.length} 条记录` : '';
+  $(`${scope}-count`).textContent = count || (scope === 'runs' ? '暂无匹配的执行记录' : '');
+  $(`${scope}-prev`).disabled = list.loading || !list.page;
+  $(`${scope}-next`).disabled = list.loading || !list.nextCursor;
+}
+function updateRunDurations(list) {
+  const rows = runRows(list).children;
+  list.items.forEach((run, i) => {
     if (run.status === 'running') rows[i].querySelector('.run-duration').textContent = duration(run);
   });
 }
-function resetRunPage() {
-  state.runQuery++;
-  state.cursors = [''];
-  state.runPage = 0;
-  state.pendingRunPage = null;
-  state.nextCursor = '';
-  state.runs = [];
-  renderRuns();
+function activeRunList() {
+  return state.history || (state.view === 'runs' ? state.globalRuns : null);
 }
-async function changeRunPage(page) {
-  const query = ++state.runQuery;
-  state.pendingRunPage = page;
-  $('runs-prev').disabled = $('runs-next').disabled = true;
-  try {
-    await refresh(true);
-  } catch (error) {
-    if (state.pendingRunPage !== page || query !== state.runQuery) return;
-    state.pendingRunPage = null;
-    renderRuns();
-    toast(error.message, true);
-  }
-}
-$('runs-prev').addEventListener('click', () => {
-  if (state.runPage > 0) changeRunPage(state.runPage - 1);
-});
-$('runs-next').addEventListener('click', () => {
-  if (!state.nextCursor) return;
-  state.cursors[state.runPage + 1] = state.nextCursor;
-  changeRunPage(state.runPage + 1);
-});
-function fetchRuns(cursor) {
+function fetchRuns(list, cursor) {
   const query = new URLSearchParams({ limit: '50' });
   if (cursor) query.set('cursor', cursor);
-  if ($('run-filter').value) query.set('job_id', $('run-filter').value);
-  if ($('run-status-filter').value) query.set('status', $('run-status-filter').value);
+  if (list.jobId) query.set('job_id', list.jobId);
+  if (list.status) query.set('status', list.status);
   return api(`/runs?${query}`);
 }
+async function loadRunPage(list, page = list.page) {
+  const revision = `${state.changes.instance}:${state.changes.runs}`;
+  if (list.loading || (page === list.page && list.revision === revision)) return;
+  list.loading = true;
+  list.error = '';
+  renderRuns(list);
+  try {
+    let result;
+    try {
+      result = await fetchRuns(list, list.cursors[page]);
+    } catch (error) {
+      if (error.status !== 409 || page === 0 || list !== activeRunList()) throw error;
+      page = 0;
+      result = await fetchRuns(list, '');
+    }
+    if (list !== activeRunList()) return;
+    list.items = result.items;
+    list.page = page;
+    list.cursors.length = page + 1;
+    list.nextCursor = result.next_cursor || '';
+    if (list.nextCursor) list.cursors.push(list.nextCursor);
+    list.revision = revision;
+    if (list.scope === 'runs') {
+      let optionsChanged = false;
+      for (const run of list.items) {
+        if (!state.runJobs.has(run.job_id)) {
+          state.runJobs.set(run.job_id, run.job_name);
+          if (!state.jobNames.has(run.job_id)) optionsChanged = true;
+        }
+      }
+      if (optionsChanged) renderRunOptions();
+    }
+  } catch (error) {
+    if (list !== activeRunList()) return;
+    list.error = error.message;
+    if (list.scope === 'runs') toast(error.message, true);
+  } finally {
+    list.loading = false;
+    if (list === activeRunList()) renderRuns(list);
+  }
+}
+for (const scope of ['runs', 'history']) {
+  $(`${scope}-prev`).addEventListener('click', () => {
+    const list = activeRunList();
+    if (list?.page > 0) loadRunPage(list, list.page - 1);
+  });
+  $(`${scope}-next`).addEventListener('click', () => {
+    const list = activeRunList();
+    if (list?.nextCursor) loadRunPage(list, list.page + 1);
+  });
+}
+
+function updateHistoryOptions() {
+  const list = state.history;
+  const options = new Map(state.jobNames);
+  if (options.has(list.jobId)) list.jobName = options.get(list.jobId);
+  else options.set(list.jobId, `${list.jobName}（已删除）`);
+  $('history-job').replaceChildren(...[...options].map(([id, name]) => new Option(name, id)));
+  $('history-job').value = list.jobId;
+  $('history-edit').disabled = !state.jobNames.has(list.jobId);
+  $('history-path').textContent = `任务调度 / ${options.get(list.jobId)}`;
+}
+function setHistoryJob(jobId, jobName, openerId) {
+  state.history = {
+    ...runList('history', jobId, $('history-status-filter').value),
+    jobName, openerId
+  };
+  updateHistoryOptions();
+  $('history-dialog').querySelector('.history-body').scrollTop = 0;
+  loadRunPage(state.history);
+}
+function openHistory(job) {
+  $('history-status-filter').value = '';
+  setHistoryJob(job.id, job.name, job.id);
+  $('history-dialog').showModal();
+}
+$('history-status-filter').replaceChildren(...[...$('run-status-filter').options].map((option) => option.cloneNode(true)));
+for (const id of ['history-job', 'history-status-filter']) {
+  $(id).addEventListener('change', () => {
+    const jobId = $('history-job').value;
+    setHistoryJob(jobId, state.jobNames.get(jobId) || state.history.jobName, state.history.openerId);
+  });
+}
+$('history-edit').addEventListener('click', () => {
+  const job = state.jobs.find((item) => item.id === state.history.jobId);
+  if (job) editJob(job);
+});
+$('history-dialog').addEventListener('close', () => {
+  if ($('history-dialog').open || !state.history) return;
+  const { openerId } = state.history;
+  state.history = null;
+  if (document.activeElement === document.body) {
+    const row = $('job-rows').querySelector(`[data-id="${CSS.escape(openerId)}"]`);
+    (row?.querySelector('.job-history') || $('search')).focus({ preventScroll: true });
+  }
+});
 function refresh(afterMutation = false) {
   if (!state.active) return Promise.resolve();
   const generation = state.generation;
@@ -404,19 +500,12 @@ async function refreshData(generation) {
   const needSystem = state.revisions.system !== key('settings');
   const needVariables = changed('variables');
   const needSettings = state.view === 'settings' && changed('settings');
-  const query = state.runQuery, runKey = `${key('runs')}:${query}`;
-  const pageIndex = state.pendingRunPage ?? state.runPage, cursor = state.cursors[pageIndex];
-  const needRuns = state.view === 'runs' && state.revisions.runs !== runKey;
-  const [jobs, system, variables, settings, passkeys, page] = await Promise.all([
+  const [jobs, system, variables, settings, passkeys] = await Promise.all([
     needJobs && api('/jobs'),
     needSystem && api('/system'),
     needVariables && api('/variables'),
     needSettings && api('/settings'),
-    needSettings && api('/passkeys'),
-    needRuns && fetchRuns(cursor).catch((error) => {
-      if (error.status !== 409 || !cursor) throw error;
-      return fetchRuns('').then((fresh) => ({ ...fresh, reset: true }));
-    })
+    needSettings && api('/passkeys')
   ]);
   if (generation !== state.generation) return;
   const countsChanged = changes.completed !== state.changes.completed || changes.successful !== state.changes.successful;
@@ -428,7 +517,6 @@ async function refreshData(generation) {
       if (!state.jobNames.has(id) && (state.runJobs.has(id) || $('run-filter').value === id)) state.runJobs.set(id, name);
     }
   }
-  let runOptionsChanged = namesChanged;
   state.changes = changes;
   if (jobs) { state.jobs = jobs; state.revisions.jobs = key('jobs'); }
   if (system) { state.system = system; state.revisions.system = key('settings'); }
@@ -439,33 +527,29 @@ async function refreshData(generation) {
     state.revisions.settings = key('settings');
     renderSettings();
   }
-  if (page && query === state.runQuery) {
-    if (page.reset) state.cursors = [''];
-    state.runPage = page.reset ? 0 : pageIndex;
-    state.pendingRunPage = null;
-    state.runs = page.items;
-    state.nextCursor = page.next_cursor || '';
-    for (const run of state.runs) {
-      if (!state.runJobs.has(run.job_id)) {
-        state.runJobs.set(run.job_id, run.job_name);
-        if (!state.jobNames.has(run.job_id)) runOptionsChanged = true;
-      }
-    }
-    state.revisions.runs = runKey;
-    renderRuns();
+  if (namesChanged) {
+    renderRunOptions();
+    if (state.history) updateHistoryOptions();
   }
-  if (state.view === 'runs') updateRunDurations();
-  if (runOptionsChanged) renderRunOptions();
   if (jobs) renderJobs();
   if (namesChanged || variables) renderVariables();
   if (jobs || system || countsChanged) renderOverview();
   connection(true);
   if (state.log) updateLog().catch(() => {});
+  const list = activeRunList();
+  if (list) {
+    await loadRunPage(list);
+    if (list === activeRunList()) updateRunDurations(list);
+  }
 }
 
 function editJob(job = null) {
   state.editing = job?.id || null;
   $('job-form').reset();
+  const path = ['任务调度'];
+  if (job) path.push(job.name);
+  if ($('history-dialog').open) path.push('执行记录');
+  $('job-path').textContent = path.join(' / ');
   $('job-dialog-title').textContent = job ? '编辑任务' : '新建任务';
   $('save-job').textContent = job ? '保存更改' : '创建任务';
   $('job-name').value = job?.name || '';
@@ -480,6 +564,7 @@ function editJob(job = null) {
   $('job-identity').textContent = job ? `运行身份 UID ${job.run_uid} / GID ${job.run_gid}。可写目录需允许此身份访问。` : '保存后分配独立的任务运行身份。';
   setError('job-error', '');
   $('job-dialog').showModal();
+  queueSchedulePreview();
 }
 $('new-job').addEventListener('click', () => editJob());
 $('empty-new-job').addEventListener('click', () => editJob());
@@ -488,15 +573,79 @@ function syncSchedulePreset() {
   preset.value = $('job-schedule').value.trim().replace(/\s+/g, ' ');
   if (preset.selectedIndex === -1) preset.value = '';
 }
-$('job-schedule').addEventListener('input', syncSchedulePreset);
-$('schedule-preset').addEventListener('change', () => { if ($('schedule-preset').value) $('job-schedule').value = $('schedule-preset').value; });
+let previewTimer, previewRequest;
+function cancelSchedulePreview() {
+  clearTimeout(previewTimer);
+  previewRequest?.abort();
+  previewRequest = null;
+}
+function previewTimeItem(stamp) {
+  const item = document.createElement('li');
+  const time = document.createElement('time');
+  time.dateTime = stamp;
+  // Keep the scheduler's local clock and UTC offset, including repeated DST hours.
+  time.textContent = stamp.slice(0, 19).replace('T', ' ');
+  const offset = document.createElement('span');
+  offset.className = 'schedule-offset';
+  offset.textContent = stamp.endsWith('Z') ? 'UTC' : `UTC${stamp.slice(-6)}`;
+  time.append(' ', offset);
+  item.append(time);
+  return item;
+}
+function queueSchedulePreview(delay = 0) {
+  cancelSchedulePreview();
+  const input = $('job-schedule');
+  const schedule = input.value.trim();
+  const status = $('schedule-preview-status');
+  const list = $('schedule-preview-times');
+  list.replaceChildren();
+  $('schedule-preview-zone').textContent = '';
+  input.removeAttribute('aria-invalid');
+  status.classList.remove('error');
+  status.textContent = schedule ? '正在计算…' : '输入 Cron 表达式后可预览。';
+  $('refresh-schedule-preview').disabled = !schedule;
+  if (!schedule) return;
+  const request = new AbortController();
+  previewRequest = request;
+  previewTimer = setTimeout(async () => {
+    try {
+      const { timezone, times } = await api(`/cron/preview?${new URLSearchParams({ schedule })}`, { signal: request.signal });
+      if (request.signal.aborted || !$('job-dialog').open) return;
+      $('schedule-preview-zone').textContent = `调度时区 · ${timezone}`;
+      status.textContent = times.length ? '' : '未来 8 年内没有匹配的时间。';
+      list.replaceChildren(...times.map(previewTimeItem));
+    } catch (error) {
+      if (request.signal.aborted || !$('job-dialog').open) return;
+      if (error.status === 400) input.setAttribute('aria-invalid', 'true');
+      status.classList.add('error');
+      status.textContent = error.status === 400 ? error.message : '暂时无法获取预览，请刷新重试。';
+    }
+  }, delay);
+}
+$('job-schedule').addEventListener('input', () => {
+  syncSchedulePreset();
+  queueSchedulePreview(250);
+});
+$('schedule-preset').addEventListener('change', () => {
+  if (!$('schedule-preset').value) return;
+  $('job-schedule').value = $('schedule-preset').value;
+  queueSchedulePreview();
+});
+$('refresh-schedule-preview').addEventListener('click', () => queueSchedulePreview());
+$('job-dialog').addEventListener('close', () => { if (!$('job-dialog').open) cancelSchedulePreview(); });
 document.querySelectorAll('.close-dialog').forEach((b) => b.addEventListener('click', () => b.closest('dialog').close()));
 $('job-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   $('save-job').disabled = true;
   setError('job-error', '');
   const input = { name: $('job-name').value, schedule: $('job-schedule').value, command: $('job-command').value, working_dir: $('job-directory').value, timeout_sec: Number($('job-timeout').value), enabled: $('job-enabled').checked };
-  try { await api(state.editing ? `/jobs/${state.editing}` : '/jobs', { method: state.editing ? 'PUT' : 'POST', body: JSON.stringify(input) }); $('job-dialog').close(); toast(state.editing ? '任务已更新' : '任务已创建'); setView('jobs'); await refresh(true); } catch (error) { setError('job-error', error.message); } finally { $('save-job').disabled = false; }
+  try {
+    await api(state.editing ? `/jobs/${state.editing}` : '/jobs', { method: state.editing ? 'PUT' : 'POST', body: JSON.stringify(input) });
+    $('job-dialog').close();
+    toast(state.editing ? '任务已更新' : '任务已创建');
+    await refresh(true);
+  } catch (error) { setError('job-error', error.message); }
+  finally { $('save-job').disabled = false; }
 });
 $('confirm-delete').addEventListener('click', async () => {
   $('confirm-delete').disabled = true;
@@ -669,8 +818,11 @@ $('apply-cleanup').addEventListener('click', async () => {
   }
 });
 
-function openLog(run) {
-  state.log = { run, offset: 0, loaded: false, more: true, pending: false };
+function openLog(run, opener) {
+  state.log = { run, opener, offset: 0, loaded: false, more: true, pending: false };
+  $('log-path').textContent = state.history
+    ? `${$('history-path').textContent} / 执行记录`
+    : `${views[state.view][0]} / ${state.jobNames.get(run.job_id) || run.job_name}`;
   $('log-output').textContent = '正在读取日志…';
   $('log-truncated').hidden = true;
   renderLogMeta(run);
@@ -678,7 +830,6 @@ function openLog(run) {
   updateLog().catch(() => {});
 }
 function renderLogMeta(run) {
-  $('log-title').textContent = run.job_name;
   const meta = $('log-meta');
   meta.replaceChildren(badge(run.status));
   const values = [date(run.started_at, true), duration(run), run.source === 'cron' ? '定时调度' : '手动执行'];
@@ -735,7 +886,18 @@ async function updateLog() {
 }
 $('log-stop').addEventListener('click', () => stopRun(state.log?.run.id, $('log-stop')));
 $('log-clean').addEventListener('click', () => { if (state.log) openCleanup(state.log.run); });
-$('log-dialog').addEventListener('close', () => { if (!$('log-dialog').open) state.log = null; });
+$('log-dialog').addEventListener('close', () => {
+  if ($('log-dialog').open || !state.log) return;
+  const { run, opener } = state.log;
+  state.log = null;
+  if (opener.isConnected) return;
+  const list = activeRunList();
+  const rows = list ? runRows(list) : $('job-rows');
+  const id = CSS.escape(list ? run.id : run.job_id);
+  const row = rows.querySelector(`[data-id="${id}"]`);
+  const action = row?.querySelector(list ? '.open-log' : '.latest-log');
+  (action || $(state.history ? 'history-job' : list ? 'run-filter' : 'search')).focus({ preventScroll: true });
+});
 
 function canUsePasskeys() {
   return window.isSecureContext && !!window.PublicKeyCredential && !!navigator.credentials;

@@ -129,7 +129,7 @@ func (s Schedule) Matches(t time.Time) bool {
 func (s Schedule) Next(after time.Time) time.Time {
 	t := after.Truncate(time.Second).Add(time.Second)
 	limit := after.AddDate(8, 0, 0)
-	for t.Before(limit) {
+	for !t.After(limit) { // Leap days can be exactly eight years apart across a century.
 		if !s.fields[4][int(t.Month())] || !s.matchesDay(t) {
 			next := time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, t.Location())
 			if !next.After(t) { // Some zones have a clock change at midnight.

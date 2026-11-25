@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,6 +78,7 @@ func TestSchedule(t *testing.T) {
 		{"0 9 * * 1-5", "2026-10-30T09:00:00+08:00", "2026-11-02T09:00:00+08:00"},
 		{"0 0 1 * 1", "2026-10-28T00:00:00+08:00", "2026-11-01T00:00:00+08:00"},
 		{"0 0 29 2 *", "2026-10-28T00:00:00+08:00", "2028-02-29T00:00:00+08:00"},
+		{"0 0 29 2 *", "2096-02-29T00:00:00+08:00", "2104-02-29T00:00:00+08:00"},
 		{"0 0 */2 * *", "2026-10-01T00:00:00+08:00", "2026-10-03T00:00:00+08:00"},
 		{"0 0 * 1 *", "2026-01-31T00:01:00+08:00", "2027-01-01T00:00:00+08:00"},
 		{"* * * * * *", "2026-10-28T09:01:45+08:00", "2026-10-28T09:01:46+08:00"},
@@ -379,6 +381,61 @@ func TestHTTPAuthOriginCRUDAndHealth(t *testing.T) {
 	}
 	if w := request("DELETE", "/api/jobs/"+j.ID, "", token, ""); w.Code != 204 {
 		t.Fatalf("delete: %d", w.Code)
+	}
+}
+
+func TestCronPreviewAPI(t *testing.T) {
+	s, ctx := testService(t)
+	token := strings.Repeat("a", 32)
+	h := s.handler(ctx, token, &atomic.Bool{}, nil)
+	get := func(expression string, authenticated bool) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/api/cron/preview?schedule="+url.QueryEscape(expression), nil)
+		if authenticated {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	if w := get("* * * * *", false); w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated preview: %d", w.Code)
+	}
+	if w := get("60 * * * * *", true); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "秒字段") {
+		t.Fatalf("invalid schedule: %d %s", w.Code, w.Body)
+	}
+	for _, tc := range []struct {
+		expression string
+		count      int
+	}{
+		{"17 * * * * *", 5},
+		{"45 7 * * *", 5},
+		{"0 0 29 2 *", 5},
+		{"0 0 31 2 *", 0},
+	} {
+		before := time.Now()
+		w := get(tc.expression, true)
+		var preview struct {
+			Timezone string      `json:"timezone"`
+			Times    []time.Time `json:"times"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &preview); err != nil || w.Code != http.StatusOK || preview.Timezone != s.cfg.Timezone || preview.Times == nil || len(preview.Times) != tc.count {
+			t.Fatalf("preview %q: %d %s", tc.expression, w.Code, w.Body)
+		}
+		schedule, err := ParseSchedule(tc.expression)
+		if err != nil {
+			t.Fatal(err)
+		}
+		after := before
+		for i, instant := range preview.Times {
+			local := instant.In(s.location)
+			if !instant.After(after) || instant.Format(time.RFC3339) != local.Format(time.RFC3339) || !schedule.Matches(local) {
+				t.Fatalf("preview %q: unexpected occurrence %s after %s", tc.expression, instant, after)
+			}
+			if i > 0 && !schedule.Next(after.In(s.location)).Equal(instant) {
+				t.Fatalf("preview %q skipped an occurrence after %s", tc.expression, after)
+			}
+			after = instant
+		}
 	}
 }
 
